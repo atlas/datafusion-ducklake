@@ -21,6 +21,7 @@
 
 use crate::Result;
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
+use crate::metadata_pool_postgres::LakePool;
 use crate::metadata_provider::{TagObjectType, TagTarget, block_on};
 use crate::metadata_writer::directory_path;
 use crate::metadata_writer::{
@@ -279,7 +280,7 @@ const SQL_CREATE_TABLES: &[&str] = &[
 /// implementations, including DuckDB's `ducklake` extension.
 #[derive(Debug, Clone)]
 pub struct PostgresSingleCatalogMetadataWriter {
-    pool: PgPool,
+    pool: LakePool,
     commit_guard: Option<Arc<dyn PostgresCommitGuard>>,
 }
 
@@ -306,7 +307,7 @@ impl PostgresSingleCatalogMetadataWriter {
         })
         .await?;
         Ok(Self {
-            pool,
+            pool: LakePool::new(pool),
             commit_guard: None,
         })
     }
@@ -314,6 +315,12 @@ impl PostgresSingleCatalogMetadataWriter {
     /// Adopt an existing pool (e.g. one shared with a
     /// [`crate::metadata_provider_postgres::PostgresMetadataProvider`]).
     pub fn from_pool(pool: PgPool) -> Self {
+        Self::from_lake(LakePool::new(pool))
+    }
+
+    /// Adopt the lake in `pool`'s schema, sharing the pool with every other
+    /// lake on it. [`MetadataWriter::initialize_schema`] creates the schema.
+    pub fn from_lake(pool: LakePool) -> Self {
         Self {
             pool,
             commit_guard: None,
@@ -384,7 +391,7 @@ async fn reserve_identity(
 
 /// Seed an id counter from the current MAX of its backing column, so a pre-existing
 /// catalog keeps allocating without reuse. `WHERE NOT EXISTS` makes a re-open a no-op.
-async fn seed_counter(pool: &PgPool, key: &str, max_sql: &'static str) -> Result<()> {
+async fn seed_counter(pool: &LakePool, key: &str, max_sql: &'static str) -> Result<()> {
     let start: i64 = sqlx::query(max_sql).fetch_one(pool).await?.try_get(0)?;
     sqlx::query(
         "INSERT INTO ducklake_metadata (key, value, scope)
@@ -1085,7 +1092,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
         block_on(async {
             // Staged commits create the registry on demand; without it there is
             // nothing inlined to drop.
-            if !crate::PostgresMetadataProvider::from_pool(self.pool.clone())
+            if !crate::PostgresMetadataProvider::from_lake(self.pool.clone())
                 .has_inlined_data_registry()
                 .await?
             {
@@ -1262,7 +1269,8 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
         identity: &str,
         operation: Box<dyn FnOnce() -> Result<()> + '_>,
     ) -> Result<()> {
-        with_postgres_commit_lock(&self.pool, &format!("single:{identity}"), operation)
+        let lake = self.pool.schema().unwrap_or("");
+        with_postgres_commit_lock(&self.pool, &format!("single:{lake}:{identity}"), operation)
     }
 
     fn catalog_encrypted(&self) -> Result<bool> {
@@ -2410,6 +2418,14 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
 
     fn initialize_schema(&self) -> Result<()> {
         block_on(async {
+            if let Some(schema) = self.pool.schema() {
+                // Quoted by `LakePool::in_schema`.
+                sqlx::query(AssertSqlSafe(format!(
+                    "CREATE SCHEMA IF NOT EXISTS {schema}"
+                )))
+                .execute(self.pool.pool())
+                .await?;
+            }
             // sqlx runs each query() as a single prepared statement, so create each
             // table separately (see SQL_CREATE_TABLES).
             for ddl in SQL_CREATE_TABLES {

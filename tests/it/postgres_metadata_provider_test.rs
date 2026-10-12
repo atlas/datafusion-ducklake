@@ -235,7 +235,7 @@ async fn create_postgres_provider() -> anyhow::Result<(
     let provider = PostgresMetadataProvider::new(&conn_str)
         .await
         .expect("Failed to create provider");
-    init_schema(&provider.pool).await?;
+    init_schema(provider.pool.pool()).await?;
 
     Ok((provider, container))
 }
@@ -624,7 +624,7 @@ async fn test_schema_initialization_idempotent() {
     let (provider, _container) = create_postgres_provider().await.unwrap();
 
     // Initialize schema again - should be idempotent
-    init_schema(&provider.pool)
+    init_schema(provider.pool.pool())
         .await
         .expect("Schema initialization should be idempotent");
 
@@ -710,7 +710,7 @@ async fn test_list_snapshots() {
     assert_eq!(changes[1].commit_extra_info, None);
 
     sqlx::query("DROP TABLE ducklake_snapshot_changes")
-        .execute(&provider.pool)
+        .execute(provider.pool.pool())
         .await
         .unwrap();
     let snapshots = provider.list_snapshots().unwrap();
@@ -848,7 +848,7 @@ async fn test_list_views() -> anyhow::Result<()> {
     .bind("")
     .bind(1i64)
     .bind(2i64)
-    .execute(&provider.pool)
+    .execute(provider.pool.pool())
     .await?;
 
     assert_eq!(provider.list_views(1, 1)?[0].view_name, "expired_view");
@@ -968,7 +968,7 @@ async fn test_get_name_mapping() -> anyhow::Result<()> {
         "INSERT INTO ducklake_column_mapping(mapping_id, table_id, type)
          VALUES (7, 1, 'map_by_name')",
     )
-    .execute(&provider.pool)
+    .execute(provider.pool.pool())
     .await?;
     sqlx::query(
         "INSERT INTO ducklake_name_mapping(
@@ -978,7 +978,7 @@ async fn test_get_name_mapping() -> anyhow::Result<()> {
             (7, 2, 'child', 4, 1, false),
             (7, 3, 'part', 5, NULL, true)",
     )
-    .execute(&provider.pool)
+    .execute(provider.pool.pool())
     .await?;
 
     let mapping = provider.get_name_mapping(7)?;
@@ -1337,7 +1337,7 @@ async fn test_schema_capability_probe_memoized_positive_only() {
     populate_test_data(&provider)
         .await
         .expect("Failed to populate test data");
-    migrate_fixture_to_current_schema(&provider.pool)
+    migrate_fixture_to_current_schema(provider.pool.pool())
         .await
         .expect("Failed to migrate fixture schema");
 
@@ -1497,7 +1497,7 @@ async fn filter_fixture_on(
     let port = container.get_host_port_ipv4(5432).await?;
     let conn_str = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
     let provider = PostgresMetadataProvider::new(&conn_str).await?;
-    init_filter_fixture(&provider.pool).await?;
+    init_filter_fixture(provider.pool.pool()).await?;
     Ok((provider, container))
 }
 
@@ -1554,7 +1554,7 @@ async fn test_file_listing_filter_keeps_a_file_with_a_malformed_min_value() {
     let bare_cast: Result<i64, sqlx::Error> = sqlx::query_scalar(
         "SELECT count(*) FROM ducklake_file_column_stats WHERE CAST(min_value AS numeric) > 0",
     )
-    .fetch_one(&provider.pool)
+    .fetch_one(provider.pool.pool())
     .await;
     assert!(
         bare_cast.is_err(),
@@ -1604,7 +1604,7 @@ async fn test_file_listing_filter_paginates_past_pruned_files() {
 async fn test_file_listing_filter_falls_open_on_a_catalog_without_statistics() {
     let (provider, _container) = filter_fixture_provider().await.unwrap();
     sqlx::query("DROP TABLE ducklake_file_column_stats")
-        .execute(&provider.pool)
+        .execute(provider.pool.pool())
         .await
         .expect("drop the statistics table");
 
@@ -1626,7 +1626,7 @@ async fn test_file_listing_filter_uses_soft_input_validation_on_postgresql_16() 
     let (provider, _container) = filter_fixture_provider_pg16().await.unwrap();
     let soft_input_validation: bool =
         sqlx::query_scalar("SELECT to_regprocedure('pg_input_is_valid(text,text)') IS NOT NULL")
-            .fetch_one(&provider.pool)
+            .fetch_one(provider.pool.pool())
             .await
             .expect("probe the server");
     assert!(
@@ -1661,7 +1661,7 @@ async fn test_temporal_filter_prunes_the_same_without_soft_input_validation() {
     let (provider, _container) = filter_fixture_provider().await.unwrap();
     let soft_input_validation: bool =
         sqlx::query_scalar("SELECT to_regprocedure('pg_input_is_valid(text,text)') IS NOT NULL")
-            .fetch_one(&provider.pool)
+            .fetch_one(provider.pool.pool())
             .await
             .expect("probe the server");
     assert!(

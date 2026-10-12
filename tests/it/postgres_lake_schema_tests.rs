@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use arrow::array::Int64Array;
 use datafusion::prelude::*;
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::postgres::PgPool;
 use tempfile::TempDir;
 use testcontainers::ContainerAsync;
 use testcontainers::runners::AsyncRunner;
@@ -22,12 +22,11 @@ use datafusion_ducklake::{
 async fn database() -> anyhow::Result<(PgPool, ContainerAsync<Postgres>)> {
     let container = Postgres::default().start().await?;
     let port = container.get_host_port_ipv4(5432).await?;
-    let pool = PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&format!(
-            "postgresql://postgres:postgres@127.0.0.1:{port}/postgres"
-        ))
-        .await?;
+    let pool = LakePool::connect(
+        &format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres"),
+        4,
+    )
+    .await?;
     Ok((pool, container))
 }
 

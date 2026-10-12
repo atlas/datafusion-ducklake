@@ -40,6 +40,24 @@ impl LakePool {
         }
     }
 
+    /// Opens a pool of at most `max_connections` to a database holding lakes, for
+    /// [`LakePool::in_schema`] to share between them. Like
+    /// [`crate::PostgresMetadataProvider::new`], it opens the pool on the runtime this
+    /// crate drives catalog I/O on, so a synchronous catalog call never waits on a
+    /// connection registered with the caller's runtime.
+    pub async fn connect(url: &str, max_connections: u32) -> crate::Result<PgPool> {
+        let url = url.to_string();
+        Ok(
+            crate::metadata_provider::connect_on_catalog_runtime(async move {
+                sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(max_connections)
+                    .connect(&url)
+                    .await
+            })
+            .await?,
+        )
+    }
+
     /// The pool, shared with every other lake on it.
     pub fn pool(&self) -> &PgPool {
         &self.pool

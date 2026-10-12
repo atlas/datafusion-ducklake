@@ -276,6 +276,11 @@ arrow-rs's 1,048,576 rows, so its buffered row group is correspondingly larger.
 Scoped writer settings and catalog‑backed data inlining are supported. DuckDB, SQLite, MySQL, and
 multi‑catalog PostgreSQL support multi‑table Parquet, inline, and delete commits.
 
+The single‑catalog PostgreSQL writer commits `DELETE ... WHERE` and `UPDATE` like the SQLite writer:
+one snapshot per statement, superseding the delete file of each data file it touches, with an
+`UPDATE`'s new row versions in the same snapshot. It has no truncate, so `DELETE FROM t` without a
+`WHERE` is refused, and no compaction.
+
 ### Views
 
 Every metadata backend reads snapshot-visible rows from `ducklake_view`. Catalogs without that

@@ -99,6 +99,8 @@ pub mod types;
 pub(crate) mod view;
 
 // Metadata providers (feature-gated)
+#[cfg(feature = "metadata-postgres")]
+pub mod metadata_pool_postgres;
 #[cfg(feature = "metadata-duckdb")]
 pub mod metadata_provider_duckdb;
 #[cfg(feature = "metadata-mysql")]
@@ -164,6 +166,8 @@ pub use table::DuckLakeTable;
 pub use table_functions::register_ducklake_functions;
 
 // Re-export metadata providers (feature-gated)
+#[cfg(feature = "metadata-postgres")]
+pub use metadata_pool_postgres::LakePool;
 #[cfg(feature = "metadata-duckdb")]
 pub use metadata_provider_duckdb::DuckdbMetadataProvider;
 #[cfg(feature = "metadata-mysql")]

@@ -4,6 +4,7 @@ use crate::Result;
 use crate::inlined_filter::{
     InlinedDataScan, InlinedFilter, InlinedSqlBind, InlinedSqlDialect, render_inlined_filter,
 };
+use crate::metadata_pool_postgres::LakePool;
 use crate::metadata_provider::{
     ColumnTag, ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
     DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedData, DuckLakeInlinedDelete,
@@ -215,8 +216,8 @@ impl SchemaCapabilities {
 /// narrowed form of the query is what the catalog could not run. The bind order
 /// is the listing query's, filtered or not: statistics literals are inlined by
 /// [`crate::stats_filter`], so narrowing the query adds no parameter.
-pub(crate) async fn fetch_data_file_page(
-    pool: &PgPool,
+pub(crate) async fn fetch_data_file_page<'e>(
+    pool: impl sqlx::PgExecutor<'e>,
     sql: &str,
     table_id: i64,
     snapshot_id: i64,
@@ -605,7 +606,7 @@ pub(crate) fn stats_filter_sql(
 /// PostgreSQL-based metadata provider for DuckLake catalogs.
 #[derive(Debug, Clone)]
 pub struct PostgresMetadataProvider {
-    pub pool: PgPool,
+    pub pool: LakePool,
     // Positive-only memo of the optional-schema capability probes. `Arc` so
     // derived `Clone` shares the cache across provider clones.
     schema_capabilities: Arc<OnceLock<SchemaCapabilities>>,
@@ -621,7 +622,7 @@ impl PostgresMetadataProvider {
         .await?;
 
         Ok(Self {
-            pool,
+            pool: LakePool::new(pool),
             schema_capabilities: Arc::new(OnceLock::new()),
         })
     }
@@ -640,6 +641,12 @@ impl PostgresMetadataProvider {
     /// is block the runtime its own connections came from. `new` leaves nothing to
     /// arrange, opening the whole pool on the catalog runtime.
     pub fn from_pool(pool: PgPool) -> Self {
+        Self::from_lake(LakePool::new(pool))
+    }
+
+    /// Creates a provider for the lake in `pool`'s schema, sharing the pool
+    /// with every other lake on it.
+    pub fn from_lake(pool: LakePool) -> Self {
         Self {
             pool,
             schema_capabilities: Arc::new(OnceLock::new()),
@@ -669,12 +676,12 @@ impl PostgresMetadataProvider {
         let row: (bool, bool, bool, bool, bool, bool, bool, bool) = sqlx::query_as(
             "SELECT
                EXISTS (SELECT 1 FROM information_schema.columns
-                       WHERE table_name = 'ducklake_data_file' AND column_name = 'partial_max'),
+                       WHERE table_schema = current_schema() AND table_name = 'ducklake_data_file' AND column_name = 'partial_max'),
                EXISTS (SELECT 1 FROM information_schema.columns
-                       WHERE table_name = 'ducklake_delete_file' AND column_name = 'partial_max'),
+                       WHERE table_schema = current_schema() AND table_name = 'ducklake_delete_file' AND column_name = 'partial_max'),
                to_regclass('ducklake_schema_versions') IS NOT NULL,
                EXISTS (SELECT 1 FROM information_schema.columns
-                       WHERE table_name = 'ducklake_data_file' AND column_name = 'partition_id'),
+                       WHERE table_schema = current_schema() AND table_name = 'ducklake_data_file' AND column_name = 'partition_id'),
                to_regclass('ducklake_inlined_data_tables') IS NOT NULL,
                to_regclass('ducklake_view') IS NOT NULL,
                to_regprocedure('pg_input_is_valid(text,text)') IS NOT NULL,

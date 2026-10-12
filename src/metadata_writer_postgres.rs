@@ -11,6 +11,7 @@
 
 use crate::Result;
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
+use crate::metadata_pool_postgres::Begin;
 use crate::metadata_provider::{TagObjectType, TagTarget, block_on};
 use crate::metadata_writer::is_inlined_system_column;
 use crate::metadata_writer::{
@@ -892,8 +893,8 @@ async fn record_file_reference(
 /// DuckLake readers expect. Idempotent. Used by the single-catalog writer; the
 /// multicatalog layout keeps its paths as given because its cleanup APIs match
 /// `data_path` strings exactly and DuckDB never reads that layout.
-pub(crate) async fn migrate_directory_paths(pool: &PgPool) -> Result<()> {
-    let mut tx = pool.begin().await?;
+pub(crate) async fn migrate_directory_paths(pool: &impl Begin) -> Result<()> {
+    let mut tx = pool.begin_catalog().await?;
     sqlx::query(
         "UPDATE ducklake_metadata SET value = value || '/'
          WHERE key = 'data_path' AND scope IS NULL AND value <> '' AND value NOT LIKE '%/'",
@@ -2797,7 +2798,7 @@ pub(crate) async fn apply_inlined_deletes_at_snapshot(
 }
 
 pub(crate) fn set_postgres_table_setting(
-    pool: &PgPool,
+    pool: &impl Begin,
     catalog_id: Option<i64>,
     table_id: i64,
     key: &str,
@@ -2805,7 +2806,7 @@ pub(crate) fn set_postgres_table_setting(
 ) -> Result<()> {
     let key = validate_table_setting(key)?;
     block_on(async {
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_catalog().await?;
         if let Some(catalog_id) = catalog_id {
             assert_table_in_catalog(catalog_id, table_id, &mut tx).await?;
         }
@@ -2827,12 +2828,12 @@ pub(crate) fn set_postgres_table_setting(
 }
 
 pub(crate) fn with_postgres_commit_lock(
-    pool: &PgPool,
+    pool: &impl Begin,
     identity: &str,
     operation: Box<dyn FnOnce() -> Result<()> + '_>,
 ) -> Result<()> {
     block_on(async {
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_catalog().await?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(identity)
             .execute(&mut *tx)

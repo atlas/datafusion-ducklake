@@ -3545,7 +3545,7 @@ fn arrow_schema_to_column_defs(schema: &Schema) -> Result<Vec<ColumnDef>> {
     schema
         .fields()
         .iter()
-        .map(|field| ColumnDef::from_arrow(field.name(), field.data_type(), field.is_nullable()))
+        .map(|field| ColumnDef::from_arrow_field(field))
         .collect()
 }
 
@@ -3626,6 +3626,11 @@ fn build_schema_with_field_ids(schema: &Schema, column_ids: &[i64]) -> Result<Sc
             data_type => data_type.clone(),
         };
         let mut metadata: HashMap<String, String> = field.metadata().clone();
+        if crate::geometry::is_geometry_field(field)? {
+            // Without a CRS, as DuckDB writes geometry: the lake keeps none, and a
+            // file that named one would read back as a different Arrow field.
+            metadata.extend(crate::geometry::geometry_field("", true).metadata().clone());
+        }
         metadata.insert("PARQUET:field_id".to_string(), field_id.to_string());
         Ok(Field::new(field.name(), data_type, field.is_nullable()).with_metadata(metadata))
     }

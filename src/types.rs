@@ -789,6 +789,12 @@ pub fn build_arrow_schema(columns: &[DuckLakeTableColumn]) -> Result<Schema> {
     let fields: Result<Vec<Field>> = columns
         .iter()
         .map(|col| {
+            if crate::geometry::is_geometry_type(&col.column_type) {
+                return Ok(crate::geometry::geometry_field(
+                    &col.column_name,
+                    col.is_nullable,
+                ));
+            }
             let data_type = read_compatible_data_type(&col.data_type()?, true);
             Ok(Field::new(&col.column_name, data_type, col.is_nullable))
         })
@@ -801,6 +807,12 @@ pub(crate) fn build_strict_arrow_schema(columns: &[DuckLakeTableColumn]) -> Resu
     let fields = columns
         .iter()
         .map(|column| {
+            if crate::geometry::is_geometry_type(&column.column_type) {
+                return Ok(crate::geometry::geometry_field(
+                    &column.column_name,
+                    column.is_nullable,
+                ));
+            }
             Ok(Field::new(
                 &column.column_name,
                 column.data_type()?,

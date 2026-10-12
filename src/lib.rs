@@ -75,6 +75,7 @@ pub mod delete_filter;
 pub mod encryption;
 pub mod error;
 pub(crate) mod field_id_adapter;
+pub mod geometry;
 pub mod information_schema;
 pub mod inlined_filter;
 pub(crate) mod lazy_delete_filter;

@@ -1487,7 +1487,7 @@ fn insert_file_column_stats(
             "INSERT INTO ducklake_file_column_stats
                  (data_file_id, table_id, column_id, column_size_bytes,
                   value_count, null_count, min_value, max_value, contains_nan, extra_stats)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 data_file_id,
                 table_id,
@@ -1498,6 +1498,7 @@ fn insert_file_column_stats(
                 stat.min_value.as_deref(),
                 stat.max_value.as_deref(),
                 stat.contains_nan,
+                stat.extra_stats.as_deref(),
             ],
         )?;
     }
@@ -1580,7 +1581,7 @@ fn recompute_table_column_stats(
     // before we issue the DELETE/INSERT writes below.
     let per_file: Vec<FileColumnStat> = {
         let mut stmt = tx.prepare(
-            "SELECT s.column_id, s.min_value, s.max_value, s.null_count, s.contains_nan
+            "SELECT s.column_id, s.min_value, s.max_value, s.null_count, s.contains_nan, s.extra_stats
              FROM ducklake_file_column_stats s
              JOIN ducklake_data_file d ON d.data_file_id = s.data_file_id
              WHERE d.table_id = ? AND d.end_snapshot IS NULL",
@@ -1592,6 +1593,7 @@ fn recompute_table_column_stats(
                 max_value: row.get::<_, Option<String>>(2)?,
                 null_count: row.get::<_, Option<i64>>(3)?,
                 contains_nan: row.get::<_, Option<bool>>(4)?,
+                extra_stats: row.get::<_, Option<String>>(5)?,
             })
         })?;
         mapped.collect::<duckdb::Result<Vec<_>>>()?
@@ -1615,7 +1617,7 @@ fn recompute_table_column_stats(
         tx.execute(
             "INSERT INTO ducklake_table_column_stats
                  (table_id, column_id, contains_null, contains_nan, min_value, max_value, extra_stats)
-             VALUES (?, ?, ?, ?, ?, ?, NULL)",
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
             params![
                 table_id,
                 g.column_id,
@@ -1623,6 +1625,7 @@ fn recompute_table_column_stats(
                 g.contains_nan,
                 g.min_value,
                 g.max_value,
+                g.extra_stats,
             ],
         )?;
     }

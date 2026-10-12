@@ -125,8 +125,29 @@ the read backend: `--no-default-features --features metadata-duckdb` (requires
 | Integers / floats / boolean           |    ✅     |                                                              |
 | Strings / dates / timestamps          |    ✅     |                                                              |
 | Decimal (precision & scale)           |    ✅     |                                                              |
-| Geometry                              |    ✅     | Mapped to `Binary` (WKB)                                     |
+| Geometry                              |    ✅     | `geoarrow.wkb`; top-level columns only, see below            |
 | Complex / nested (list, struct, map)  | Supported | Recursive types, nullable evolution, inlining; no pruning       |
+
+### Geometry
+
+Geometry columns are stored as DuckDB's DuckLake extension stores them, so each side reads
+the other's:
+
+- **Arrow type.** A `geometry` column reads as `Binary` WKB marked with the
+  `geoarrow.wkb` extension type, and a written field marked `geoarrow.wkb` becomes a
+  `geometry` column. Any other GeoArrow encoding (`geoarrow.point`, `geoarrow.wkt`, ...)
+  is refused; encode it as WKB first. Plain `Binary` stays `blob`.
+- **Files.** Values are WKB in a Parquet column with the `GEOMETRY` logical type
+  (the `parquet` crate's `geospatial` feature).
+- **No CRS.** DuckDB keeps none in the lake, neither in the catalog type nor in the
+  Parquet type, so a CRS on a written field is left out. Keep it beside the lake.
+- **Statistics.** `min_value` and `max_value` stay `NULL`; `extra_stats` holds the bounding
+  box and the shapes present, as DuckDB writes it:
+  `{"bbox": {"xmin": ..., "mmax": ...}, "types": ["point", "linestring_z"]}`.
+  The table's roll-up has a box only when every live file has one. Scans do not prune on
+  the box yet.
+- **Nesting.** A geometry inside a struct, list or map is refused on write, and one written
+  by DuckDB reads back as WKB without the extension type.
 
 ### Column defaults
 

@@ -7,7 +7,7 @@ use crate::metadata_provider::{TagObjectType, TagTarget, snapshot_change_tokens}
 use crate::types::{arrow_to_ducklake_type, ducklake_to_arrow_type};
 use crate::{DuckLakeError, Result};
 use arrow::array::{Array, FixedSizeBinaryArray};
-use arrow::datatypes::{DataType, Schema as ArrowSchema};
+use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use arrow::record_batch::RecordBatch;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -384,6 +384,25 @@ impl ColumnDef {
         })
     }
 
+    /// Create a column definition from an Arrow field.
+    ///
+    /// Like [`ColumnDef::from_arrow`], except that a `geoarrow.wkb` field becomes a
+    /// `geometry` column. Any other GeoArrow encoding, and geometry nested inside
+    /// another type, is refused.
+    pub fn from_arrow_field(field: &Field) -> Result<Self> {
+        if crate::geometry::is_geometry_field(field)? {
+            let mut column = Self::new(
+                field.name(),
+                crate::geometry::GEOMETRY_TYPE,
+                field.is_nullable(),
+            )?;
+            column.data_type = DataType::Binary;
+            return Ok(column);
+        }
+        crate::geometry::refuse_nested_geometry(field.name(), field.data_type())?;
+        Self::from_arrow(field.name(), field.data_type(), field.is_nullable())
+    }
+
     /// Set a DuckLake literal default for this column.
     pub fn with_default(mut self, value: impl Into<String>) -> Result<Self> {
         let value = value.into();
@@ -435,6 +454,10 @@ pub(crate) fn catalog_column_defs(columns: &[ColumnDef]) -> Result<Vec<CatalogCo
             &mut result,
         )?;
         let root = &mut result[root_index];
+        if crate::geometry::is_geometry_type(&column.ducklake_type) {
+            root.ducklake_type.clone_from(&column.ducklake_type);
+            root.logical_type.clone_from(&column.ducklake_type);
+        }
         root.initial_default.clone_from(&column.initial_default);
         root.default_value.clone_from(&column.default_value);
         root.default_value_type
@@ -727,6 +750,9 @@ pub struct ColumnStat {
     /// Total compressed size of the column in bytes, summed over the file's
     /// column chunks (parquet `total_compressed_size`).
     pub column_size_bytes: Option<i64>,
+    /// Type-specific statistics, such as a geometry column's bounding box and
+    /// shapes (see [`crate::geometry::GeometryStats`]). `None` for SQL `NULL`.
+    pub extra_stats: Option<String>,
 }
 
 /// How a committed file's `ducklake_data_file.row_id_start` is decided.

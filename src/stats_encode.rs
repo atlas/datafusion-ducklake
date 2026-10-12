@@ -224,6 +224,7 @@ pub struct FileColumnStat {
     pub max_value: Option<String>,
     pub null_count: Option<i64>,
     pub contains_nan: Option<bool>,
+    pub extra_stats: Option<String>,
 }
 
 /// One `ducklake_table_column_stats` row: the table-wide roll-up for a column.
@@ -235,6 +236,8 @@ pub struct GlobalColumnStat {
     pub max_value: Option<String>,
     pub contains_null: Option<bool>,
     pub contains_nan: Option<bool>,
+    /// Merged geometry stats, present only when every live file had them.
+    pub extra_stats: Option<String>,
 }
 
 /// Aggregate per-file column stats into the table-wide roll-up.
@@ -271,6 +274,7 @@ pub fn aggregate_global_column_stats(
         has_null: bool,
         has_nan: bool,
         numeric: bool,
+        geometry: Vec<Option<crate::geometry::GeometryStats>>,
     }
 
     let mut aggs: HashMap<i64, Agg> = HashMap::new();
@@ -285,7 +289,13 @@ pub fn aggregate_global_column_stats(
             has_null: false,
             has_nan: false,
             numeric: numeric(f.column_id),
+            geometry: Vec::new(),
         });
+        agg.geometry.push(
+            f.extra_stats
+                .as_deref()
+                .and_then(crate::geometry::GeometryStats::parse),
+        );
         if let Some(mn) = &f.min_value {
             agg.min_present += 1;
             agg.min = Some(match agg.min.take() {
@@ -332,6 +342,13 @@ pub fn aggregate_global_column_stats(
             // upper bound (NaN would sort above it), so it must never be
             // claimed while any file's NaN state is unknown.
             contains_nan: (a.nan_present == live_file_count).then_some(a.has_nan),
+            // A box covers the table only if every live file gave one.
+            extra_stats: (a.geometry.len() as i64 == live_file_count)
+                .then(|| {
+                    crate::geometry::GeometryStats::merge_all(a.geometry.iter().map(Option::as_ref))
+                })
+                .flatten()
+                .map(|stats| stats.encode()),
         })
         .collect();
     out.sort_by_key(|g| g.column_id);
@@ -804,6 +821,7 @@ mod tests {
             max_value: max.map(str::to_string),
             null_count,
             contains_nan: None,
+            extra_stats: None,
         }
     }
 
@@ -855,7 +873,8 @@ mod tests {
                 min_value: Some("9".to_string()),
                 max_value: Some("10".to_string()),
                 contains_null: Some(true),
-                contains_nan: None, // per-file contains_nan always None ⇒ unknown
+                contains_nan: None, // per-file contains_nan always None ⇒ unknown,
+                extra_stats: None,
             }]
         );
     }
@@ -876,6 +895,7 @@ mod tests {
                 max_value: None,
                 contains_null: None,
                 contains_nan: None,
+                extra_stats: None,
             }]
         );
     }

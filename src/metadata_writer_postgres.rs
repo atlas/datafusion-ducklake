@@ -1536,7 +1536,7 @@ async fn schedule_compaction_files(
 /// every commit, and against a networked Postgres the round trip dominates the
 /// work — a wide table otherwise pays one round trip per column. Passing the
 /// columns as arrays (rather than a generated `VALUES` list) keeps the bind
-/// count fixed at nine, so a table cannot approach Postgres's 65535-parameter
+/// count fixed at ten, so a table cannot approach Postgres's 65535-parameter
 /// ceiling however many columns it has.
 async fn insert_file_column_stats(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -1555,17 +1555,18 @@ async fn insert_file_column_stats(
     let mins: Vec<Option<String>> = column_stats.iter().map(|s| s.min_value.clone()).collect();
     let maxes: Vec<Option<String>> = column_stats.iter().map(|s| s.max_value.clone()).collect();
     let nans: Vec<Option<bool>> = column_stats.iter().map(|s| s.contains_nan).collect();
+    let extras: Vec<Option<String>> = column_stats.iter().map(|s| s.extra_stats.clone()).collect();
 
     sqlx::query(
         "INSERT INTO ducklake_file_column_stats
              (data_file_id, table_id, column_id, column_size_bytes,
               value_count, null_count, min_value, max_value, contains_nan, extra_stats)
          SELECT $1, $2, u.column_id, u.column_size_bytes,
-                u.value_count, u.null_count, u.min_value, u.max_value, u.contains_nan, NULL
+                u.value_count, u.null_count, u.min_value, u.max_value, u.contains_nan, u.extra_stats
          FROM UNNEST($3::bigint[], $4::bigint[], $5::bigint[], $6::bigint[],
-                     $7::text[], $8::text[], $9::boolean[])
+                     $7::text[], $8::text[], $9::boolean[], $10::text[])
               AS u(column_id, column_size_bytes, value_count, null_count,
-                   min_value, max_value, contains_nan)",
+                   min_value, max_value, contains_nan, extra_stats)",
     )
     .bind(data_file_id)
     .bind(table_id)
@@ -1576,6 +1577,7 @@ async fn insert_file_column_stats(
     .bind(&mins)
     .bind(&maxes)
     .bind(&nans)
+    .bind(&extras)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -1875,7 +1877,7 @@ async fn recompute_table_column_stats(
 
     let mut per_file: Vec<FileColumnStat> = Vec::new();
     for row in sqlx::query(
-        "SELECT s.column_id, s.min_value, s.max_value, s.null_count, s.contains_nan
+        "SELECT s.column_id, s.min_value, s.max_value, s.null_count, s.contains_nan, s.extra_stats
          FROM ducklake_file_column_stats s
          JOIN ducklake_data_file d ON d.data_file_id = s.data_file_id
          WHERE d.table_id = $1 AND d.end_snapshot IS NULL",
@@ -1890,6 +1892,7 @@ async fn recompute_table_column_stats(
             max_value: row.try_get(2)?,
             null_count: row.try_get(3)?,
             contains_nan: row.try_get(4)?,
+            extra_stats: row.try_get(5)?,
         });
     }
 
@@ -1918,13 +1921,14 @@ async fn recompute_table_column_stats(
     let contains_nan: Vec<Option<bool>> = globals.iter().map(|g| g.contains_nan).collect();
     let mins: Vec<Option<String>> = globals.iter().map(|g| g.min_value.clone()).collect();
     let maxes: Vec<Option<String>> = globals.iter().map(|g| g.max_value.clone()).collect();
+    let extras: Vec<Option<String>> = globals.iter().map(|g| g.extra_stats.clone()).collect();
 
     sqlx::query(
         "INSERT INTO ducklake_table_column_stats
              (table_id, column_id, contains_null, contains_nan, min_value, max_value, extra_stats)
-         SELECT $1, u.column_id, u.contains_null, u.contains_nan, u.min_value, u.max_value, NULL
-         FROM UNNEST($2::bigint[], $3::boolean[], $4::boolean[], $5::text[], $6::text[])
-              AS u(column_id, contains_null, contains_nan, min_value, max_value)",
+         SELECT $1, u.column_id, u.contains_null, u.contains_nan, u.min_value, u.max_value, u.extra_stats
+         FROM UNNEST($2::bigint[], $3::boolean[], $4::boolean[], $5::text[], $6::text[], $7::text[])
+              AS u(column_id, contains_null, contains_nan, min_value, max_value, extra_stats)",
     )
     .bind(table_id)
     .bind(&column_ids)
@@ -1932,6 +1936,7 @@ async fn recompute_table_column_stats(
     .bind(&contains_nan)
     .bind(&mins)
     .bind(&maxes)
+    .bind(&extras)
     .execute(&mut **tx)
     .await?;
     Ok(())

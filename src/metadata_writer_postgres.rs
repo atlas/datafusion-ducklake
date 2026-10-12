@@ -1603,7 +1603,7 @@ pub(crate) async fn detect_inlined_delete_since(
 
 // The SHARE lock orders inserts from other PostgreSQL clients with the
 // source-file check and surrounding metadata commit.
-async fn detect_new_inlined_deletes(
+pub(crate) async fn detect_new_inlined_deletes(
     table_id: i64,
     base_snapshot: i64,
     sources: &[SourceFile<'_>],

@@ -311,6 +311,11 @@ own limit for its writes (`0` unless set), and official's default `10` for a dir
 `MetadataWriter` call. A SQL `INSERT` inlines under the stored limit, else that writer limit, as
 official's insert does. A direct `DuckLakeTableWriter` write is this crate's own: it inlines under
 the writer's limit alone, whatever the catalog stores.
+The single‑catalog PostgreSQL writer commits `DELETE ... WHERE` and `UPDATE` like the SQLite writer:
+one snapshot per statement, with an `UPDATE`'s new row versions in the same snapshot. It stages row
+mutations as official does: small deletions are inlined, a data file whose rows are all deleted is
+ended, and a data file's delete file is rewritten with each position's snapshot. It has no truncate,
+so `DELETE FROM t` without a `WHERE` is refused, and no compaction.
 
 ### Views
 

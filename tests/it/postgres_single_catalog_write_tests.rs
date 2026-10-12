@@ -1091,7 +1091,6 @@ async fn unsupported_operations_error() {
             .is_err(),
         "type promotion must be rejected"
     );
-    assert!(!writer.supports_update(), "UPDATE is not supported");
 }
 
 // ---------------------------------------------------------------------------

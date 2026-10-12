@@ -33,12 +33,13 @@ use crate::metadata_pool_postgres::LakePool;
 use crate::metadata_provider::{TagObjectType, TagTarget, block_on};
 use crate::metadata_writer::directory_path;
 use crate::metadata_writer::{
-    ColumnDef, ColumnStat, CommitIds, ConflictScope, DataFileInfo, ExistingCatalogColumn,
-    MetadataWriter, MultiTableCommit, SnapshotCommitMetadata, StagedTableData, StagedTableWrite,
-    WriteMode, WriteSetupResult, assign_column_ids, catalog_column_defs, catalog_column_type_equal,
-    catalog_column_type_requires_migration, catalog_columns_differ, quote_snapshot_name,
-    quote_snapshot_table, snapshot_has_change, staged_table_write_changes, table_write_changes,
-    tag_change, top_level_column_ids, validate_name,
+    ColumnDef, ColumnStat, CommitIds, ConflictScope, DataFileInfo, DeleteFileEntry,
+    ExistingCatalogColumn, InlinedRowRef, MetadataWriter, MultiTableCommit, SnapshotCommitMetadata,
+    SourceFile, StagedTableData, StagedTableWrite, WriteMode, WriteSetupResult, assign_column_ids,
+    catalog_column_defs, catalog_column_type_equal, catalog_column_type_requires_migration,
+    catalog_columns_differ, quote_snapshot_name, quote_snapshot_table, snapshot_has_change,
+    staged_table_write_changes, table_storage_changes, table_write_changes, tag_change,
+    top_level_column_ids, validate_delete_entries, validate_name,
 };
 use crate::metadata_writer::{InlinedFlushTable, inlined_flush_changes, validate_inlined_flush};
 use crate::metadata_writer_postgres::apply_inlined_flush_at_snapshot;
@@ -46,9 +47,10 @@ use crate::metadata_writer_postgres::{
     PostgresCommitGuard, SQL_CREATE_INLINED_DATA_TABLES, apply_inlined_deletes_at_snapshot,
     apply_positional_deletes_at_snapshot, apply_row_mutation_at_snapshot, check_staged_conflicts,
     commit_files_at_snapshot, commit_guarded, commit_inlined_at_snapshot, commit_networked_guarded,
-    detect_inlined_delete_since, detect_replace_conflict as detect_staged_conflict,
-    detect_row_mutation_conflicts, drop_empty_superseded_inlined_tables_in, quote_ident,
-    set_postgres_table_setting, validate_staged_table, with_postgres_commit_lock,
+    detect_inlined_delete_since, detect_new_inlined_deletes,
+    detect_replace_conflict as detect_staged_conflict, detect_row_mutation_conflicts,
+    drop_empty_superseded_inlined_tables_in, quote_ident, set_postgres_table_setting,
+    validate_staged_table, with_postgres_commit_lock,
 };
 use crate::partition::PartitionTransform;
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -686,6 +688,7 @@ async fn record_snapshot_changes(
 /// Record the change summary for a data-write commit: whether this snapshot also
 /// created the schema/table or altered it, plus the insert/delete shape from
 /// [`table_write_changes`]. Mirrors the MySQL and SQLite writers.
+#[allow(clippy::too_many_arguments)]
 async fn record_table_write_changes(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     snapshot_id: i64,
@@ -693,6 +696,7 @@ async fn record_table_write_changes(
     schema_name: &str,
     table_name: &str,
     mode: WriteMode,
+    has_deletes: bool,
     commit_metadata: &SnapshotCommitMetadata,
 ) -> Result<()> {
     let replaced_existing_data: bool = sqlx::query_scalar(
@@ -706,7 +710,8 @@ async fn record_table_write_changes(
     .fetch_one(&mut **tx)
     .await?;
 
-    let write_changes = table_write_changes(table_id, mode, false, (replaced_existing_data, false));
+    let write_changes =
+        table_write_changes(table_id, mode, has_deletes, (replaced_existing_data, false));
     record_table_changes(
         tx,
         snapshot_id,
@@ -1695,7 +1700,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
         table_id: i64,
         schema_name: &str,
         table_name: &str,
-        _snapshot_id: i64,
+        snapshot_id: i64,
         file: &DataFileInfo,
         mode: WriteMode,
         base_snapshot: i64,
@@ -1704,119 +1709,20 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
         commit_metadata: &SnapshotCommitMetadata,
         expected_base_snapshot_id: Option<i64>,
     ) -> Result<CommitIds> {
-        block_on(async {
-            // Single atomic commit: insert the snapshot row + create schema/table if
-            // absent + finalize the column generation + retire the prior generation
-            // (Replace), then register this file and advance the monotonic
-            // row-lineage counter — all in one transaction, so the head only ever
-            // resolves to fully-populated data.
-            let mut tx = self.pool.begin().await?;
-
-            let ids = finalize_snapshot(
-                &mut tx,
-                schema_name,
-                table_name,
-                table_id,
-                columns,
-                column_ids,
-                mode,
-                base_snapshot,
-            )
-            .await?;
-            let (snapshot_id, table_id) = (ids.snapshot_id, ids.table_id);
-
-            // Caller-supplied precondition: the table's data-file generation must
-            // not have moved past the snapshot the input was read at. Replace is
-            // already fenced against `base_snapshot` inside finalize_snapshot.
-            if mode != WriteMode::Replace
-                && let Some(expected_base_snapshot_id) = expected_base_snapshot_id
-            {
-                detect_replace_conflict(
-                    &mut tx,
-                    table_id,
-                    expected_base_snapshot_id,
-                    ConflictScope::Table,
-                )
-                .await?;
-            }
-
-            // Partition-spec fence: this file must be consistent with the table's live
-            // partition generation at commit time (both directions — see
-            // enforce_partition_fence). The tx rolls back on a Conflict.
-            let partition_generation = live_partition_id(&mut tx, table_id).await?;
-            crate::metadata_writer::enforce_partition_fence(table_id, partition_generation, file)?;
-
-            // Seed the stats row for the Append path (Replace already seeded it in
-            // finalize_snapshot); ON CONFLICT DO NOTHING is a no-op if it exists.
-            seed_table_stats(&mut tx, table_id).await?;
-
-            let next_row_id: i64 =
-                sqlx::query("SELECT next_row_id FROM ducklake_table_stats WHERE table_id = $1")
-                    .bind(table_id)
-                    .fetch_one(&mut *tx)
-                    .await?
-                    .try_get(0)?;
-            let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
-
-            let data_file_id: i64 = sqlx::query(
-                "INSERT INTO ducklake_data_file
-                     (table_id, path, path_is_relative, file_size_bytes,
-                      footer_size, record_count, row_id_start, begin_snapshot)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING data_file_id",
-            )
-            .bind(table_id)
-            .bind(&file.path)
-            .bind(file.path_is_relative)
-            .bind(file.file_size_bytes)
-            .bind(file.footer_size)
-            .bind(file.record_count)
-            .bind(row_ids.stored)
-            .bind(snapshot_id)
-            .fetch_one(&mut *tx)
-            .await?
-            .try_get(0)?;
-
-            // Persist the file's zone maps + refresh the roll-up.
-            insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats).await?;
-            insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
-            crate::metadata_writer_postgres::merge_file_table_column_stats(
-                &mut tx,
-                table_id,
-                &crate::metadata_writer::catalog_fields(columns, column_ids)?,
-                &crate::metadata_writer::file_column_stats([file]),
-            )
-            .await?;
-
-            // Advance the counter and accumulate stats. `next_row_id`
-            // monotonically increases over the table's lifetime.
-            sqlx::query(
-                "UPDATE ducklake_table_stats
-                 SET next_row_id     = next_row_id + $1,
-                     record_count    = record_count + $2,
-                     file_size_bytes = file_size_bytes + $3
-                 WHERE table_id = $4",
-            )
-            .bind(row_ids.advance)
-            .bind(file.record_count)
-            .bind(file.file_size_bytes)
-            .bind(table_id)
-            .execute(&mut *tx)
-            .await?;
-
-            record_table_write_changes(
-                &mut tx,
-                snapshot_id,
-                table_id,
-                schema_name,
-                table_name,
-                mode,
-                commit_metadata,
-            )
-            .await?;
-
-            self.commit_networked(tx).await?;
-            Ok(ids)
-        })
+        self.register_data_files_with_deletes_and_commit_metadata(
+            table_id,
+            schema_name,
+            table_name,
+            snapshot_id,
+            std::slice::from_ref(file),
+            &[],
+            mode,
+            base_snapshot,
+            columns,
+            column_ids,
+            commit_metadata,
+            expected_base_snapshot_id,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1853,8 +1759,138 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
         table_id: i64,
         schema_name: &str,
         table_name: &str,
+        snapshot_id: i64,
+        files: &[DataFileInfo],
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+        commit_metadata: &SnapshotCommitMetadata,
+        expected_base_snapshot_id: Option<i64>,
+    ) -> Result<CommitIds> {
+        self.register_data_files_with_deletes_and_commit_metadata(
+            table_id,
+            schema_name,
+            table_name,
+            snapshot_id,
+            files,
+            &[],
+            mode,
+            base_snapshot,
+            columns,
+            column_ids,
+            commit_metadata,
+            expected_base_snapshot_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_data_file_with_deletes(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        snapshot_id: i64,
+        file: &DataFileInfo,
+        deletes: &[DeleteFileEntry],
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+    ) -> Result<CommitIds> {
+        self.register_data_files_with_deletes_and_commit_metadata(
+            table_id,
+            schema_name,
+            table_name,
+            snapshot_id,
+            std::slice::from_ref(file),
+            deletes,
+            mode,
+            base_snapshot,
+            columns,
+            column_ids,
+            &SnapshotCommitMetadata::default(),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_data_file_with_deletes_and_commit_metadata(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        snapshot_id: i64,
+        file: &DataFileInfo,
+        deletes: &[DeleteFileEntry],
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+        commit_metadata: &SnapshotCommitMetadata,
+        expected_base_snapshot_id: Option<i64>,
+    ) -> Result<CommitIds> {
+        self.register_data_files_with_deletes_and_commit_metadata(
+            table_id,
+            schema_name,
+            table_name,
+            snapshot_id,
+            std::slice::from_ref(file),
+            deletes,
+            mode,
+            base_snapshot,
+            columns,
+            column_ids,
+            commit_metadata,
+            expected_base_snapshot_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_data_files_with_deletes(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        snapshot_id: i64,
+        files: &[DataFileInfo],
+        deletes: &[DeleteFileEntry],
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+    ) -> Result<CommitIds> {
+        self.register_data_files_with_deletes_and_commit_metadata(
+            table_id,
+            schema_name,
+            table_name,
+            snapshot_id,
+            files,
+            deletes,
+            mode,
+            base_snapshot,
+            columns,
+            column_ids,
+            &SnapshotCommitMetadata::default(),
+            None,
+        )
+    }
+
+    /// Every file registration lands here: one snapshot that creates the
+    /// schema and table if absent, finalizes the column generation, retires the
+    /// prior generation (Replace), registers `files`, and supersedes the delete
+    /// file of each data file in `deletes`, so the head only ever resolves to the
+    /// whole write. An `UPDATE` is the append of the new row versions together
+    /// with the deletes of the old ones.
+    #[allow(clippy::too_many_arguments)]
+    fn register_data_files_with_deletes_and_commit_metadata(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
         _snapshot_id: i64,
         files: &[DataFileInfo],
+        deletes: &[DeleteFileEntry],
         mode: WriteMode,
         base_snapshot: i64,
         columns: &[ColumnDef],
@@ -1867,6 +1903,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 "register_data_files: files must be non-empty".to_string(),
             ));
         }
+        validate_delete_entries(mode, deletes)?;
         block_on(async {
             let mut tx = self.pool.begin().await?;
             let ids = finalize_snapshot(
@@ -1881,6 +1918,9 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             )
             .await?;
             let (snapshot_id, table_id) = (ids.snapshot_id, ids.table_id);
+            // Caller-supplied precondition: the table's data-file generation must
+            // not have moved past the snapshot the input was read at. Replace is
+            // already fenced against `base_snapshot` inside finalize_snapshot.
             if mode != WriteMode::Replace
                 && let Some(expected_base_snapshot_id) = expected_base_snapshot_id
             {
@@ -1892,6 +1932,10 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 )
                 .await?;
             }
+            // The commit inserts rows too, so any concurrent inlined deletion of a
+            // file it deletes from conflicts.
+            let sources = SourceFile::of_entries(deletes, false);
+            detect_new_inlined_deletes(table_id, base_snapshot, &sources, &mut tx).await?;
             // Partition-spec fence (both directions, every file): each file must be
             // consistent with the table's live partition generation at commit time.
             // The tx rolls back on a Conflict.
@@ -1903,6 +1947,8 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                     file,
                 )?;
             }
+            // Seed the stats row for the Append path (Replace already seeded it in
+            // finalize_snapshot); ON CONFLICT DO NOTHING is a no-op if it exists.
             seed_table_stats(&mut tx, table_id).await?;
             let mut next_row_id: i64 =
                 sqlx::query("SELECT next_row_id FROM ducklake_table_stats WHERE table_id = $1")
@@ -1932,6 +1978,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 .fetch_one(&mut *tx)
                 .await?
                 .try_get(0)?;
+                // Persist the file's zone maps.
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
                     .await?;
                 insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
@@ -1947,6 +1994,9 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 &crate::metadata_writer::file_column_stats(files),
             )
             .await?;
+            // Advance the counter and accumulate stats. `next_row_id`
+            // monotonically increases over the table's lifetime. Deletes are
+            // counted at read time, so `record_count` stays gross.
             sqlx::query(
                 "UPDATE ducklake_table_stats
                  SET next_row_id     = next_row_id + $1,
@@ -1960,6 +2010,14 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .bind(table_id)
             .execute(&mut *tx)
             .await?;
+            apply_positional_deletes_at_snapshot(
+                &mut tx,
+                table_id,
+                snapshot_id,
+                base_snapshot,
+                deletes,
+            )
+            .await?;
             record_table_write_changes(
                 &mut tx,
                 snapshot_id,
@@ -1967,12 +2025,118 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 schema_name,
                 table_name,
                 mode,
+                !deletes.is_empty(),
                 commit_metadata,
             )
             .await?;
             self.commit_networked(tx).await?;
             Ok(ids)
         })
+    }
+
+    fn commit_positional_deletes(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        base_snapshot: i64,
+        deletes: &[DeleteFileEntry],
+    ) -> Result<CommitIds> {
+        self.commit_deletes(
+            table_id,
+            schema_name,
+            table_name,
+            base_snapshot,
+            deletes,
+            &[],
+        )
+    }
+
+    fn commit_inlined_deletes(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        base_snapshot: i64,
+        rows: &[InlinedRowRef],
+    ) -> Result<CommitIds> {
+        self.commit_deletes(table_id, schema_name, table_name, base_snapshot, &[], rows)
+    }
+
+    /// A `DELETE ... WHERE`: one snapshot that supersedes the delete file of each
+    /// data file in `positional` and ends each inlined row in `inlined`, with no
+    /// new data file. Each data file's live delete file must still be the one the
+    /// positions were read against, and the file must still be live.
+    fn commit_deletes(
+        &self,
+        table_id: i64,
+        _schema_name: &str,
+        _table_name: &str,
+        base_snapshot: i64,
+        positional: &[DeleteFileEntry],
+        inlined: &[InlinedRowRef],
+    ) -> Result<CommitIds> {
+        if positional.is_empty() && inlined.is_empty() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "commit_deletes requires at least one delete".to_string(),
+            ));
+        }
+        // A positional delete never retires the data files it targets, so it is
+        // Append-semantics for validation (also enforces distinct data files).
+        validate_delete_entries(WriteMode::Append, positional)?;
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            // Taking the snapshot id serialises this commit with the lake's others,
+            // so the checks below see every delete committed before it.
+            let (snapshot_id, _) = insert_snapshot(&mut tx).await?;
+            let sources = SourceFile::of_entries(positional, true);
+            detect_new_inlined_deletes(table_id, base_snapshot, &sources, &mut tx).await?;
+            apply_positional_deletes_at_snapshot(
+                &mut tx,
+                table_id,
+                snapshot_id,
+                base_snapshot,
+                positional,
+            )
+            .await?;
+            apply_inlined_deletes_at_snapshot(
+                &mut tx,
+                table_id,
+                snapshot_id,
+                base_snapshot,
+                inlined,
+            )
+            .await?;
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &table_storage_changes(table_id, None, !positional.is_empty(), !inlined.is_empty()),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
+            let schema_id: i64 =
+                sqlx::query_scalar("SELECT schema_id FROM ducklake_table WHERE table_id = $1")
+                    .bind(table_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            tx.commit().await?;
+            Ok(CommitIds {
+                snapshot_id,
+                schema_id,
+                table_id,
+            })
+        })
+    }
+
+    fn supports_update(&self) -> bool {
+        true
+    }
+
+    /// `commit_multi_table` commits the row mutations `UPDATE` and `DELETE`
+    /// stage (see `commit_staged` above): files dropped whole, inlined
+    /// deletions and inlined rows that keep their row ids, as official does.
+    fn supports_inlined_row_mutations(&self) -> bool {
+        true
     }
 
     fn set_partition_spec(
@@ -2440,6 +2604,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 schema_name,
                 table_name,
                 mode,
+                false,
                 &SnapshotCommitMetadata::default(),
             )
             .await?;

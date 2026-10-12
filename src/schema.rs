@@ -427,7 +427,7 @@ impl SchemaProvider for DuckLakeSchema {
             .fields()
             .iter()
             .map(|field| {
-                ColumnDef::from_arrow(field.name(), field.data_type(), field.is_nullable())
+                ColumnDef::from_arrow_field(field)
                     .map_err(|e| DataFusionError::External(Box::new(e)))
             })
             .collect::<DataFusionResult<Vec<_>>>()?;

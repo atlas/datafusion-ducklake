@@ -784,6 +784,22 @@ fn compute(
             (ok && !row_groups.is_empty()).then_some(sum)
         };
 
+        // A geometry column's box and shapes, merged over its row groups. Parquet
+        // records them only for a `GEOMETRY` column, so this is `None` elsewhere.
+        let extra_stats = crate::geometry::GeometryStats::merge_all(
+            row_groups
+                .iter()
+                .map(|rg| {
+                    rg.column(leaf)
+                        .geo_statistics()
+                        .and_then(crate::geometry::GeometryStats::from_parquet)
+                })
+                .collect::<Vec<_>>()
+                .iter()
+                .map(Option::as_ref),
+        )
+        .map(|stats| stats.encode());
+
         out.push(ColumnStat {
             column_id,
             min_value: min_scalar.as_ref().and_then(stats_encode::encode_file_stat),
@@ -792,6 +808,7 @@ fn compute(
             value_count,
             contains_nan,
             column_size_bytes,
+            extra_stats,
         });
     }
 

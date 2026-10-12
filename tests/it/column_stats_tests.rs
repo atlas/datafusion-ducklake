@@ -1144,6 +1144,7 @@ async fn register_refuses_duplicate_column_stats() {
         .begin_write_transaction("main", "t", &columns, WriteMode::Replace)
         .unwrap();
     let stat = |min: &str, max: &str| ColumnStat {
+        extra_stats: None,
         column_id: setup.column_ids[0],
         min_value: Some(min.to_string()),
         max_value: Some(max.to_string()),

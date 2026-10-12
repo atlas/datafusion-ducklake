@@ -460,6 +460,8 @@ pub struct FileColumnStat {
     pub contains_nan: Option<bool>,
     /// The number of non-NULL values, as official records it.
     pub value_count: Option<i64>,
+    /// A `geometry` column's bounding box and shapes, as DuckDB records them.
+    pub extra_stats: Option<String>,
 }
 
 impl FileColumnStat {
@@ -479,6 +481,8 @@ pub struct GlobalColumnStat {
     pub max_value: Option<String>,
     pub contains_null: Option<bool>,
     pub contains_nan: Option<bool>,
+    /// Merged geometry stats, present only when every live file had them.
+    pub extra_stats: Option<String>,
 }
 
 /// Aggregate per-file column stats into the table-wide roll-up.
@@ -517,6 +521,7 @@ pub fn aggregate_global_column_stats(
         has_null: bool,
         has_nan: bool,
         kind: StatKind,
+        geometry: Vec<Option<crate::geometry::GeometryStats>>,
     }
 
     let mut aggs: HashMap<i64, Agg> = HashMap::new();
@@ -531,7 +536,13 @@ pub fn aggregate_global_column_stats(
             has_null: false,
             has_nan: false,
             kind: kind(f.column_id),
+            geometry: Vec::new(),
         });
+        agg.geometry.push(
+            f.extra_stats
+                .as_deref()
+                .and_then(crate::geometry::GeometryStats::parse),
+        );
         if f.all_null() {
             agg.min_present += 1;
             agg.max_present += 1;
@@ -583,6 +594,13 @@ pub fn aggregate_global_column_stats(
             // upper bound (NaN would sort above it), so it must never be
             // claimed while any file's NaN state is unknown.
             contains_nan: (a.nan_present == live_file_count).then_some(a.has_nan),
+            // A box covers the table only if every live file gave one.
+            extra_stats: (a.geometry.len() as i64 == live_file_count)
+                .then(|| {
+                    crate::geometry::GeometryStats::merge_all(a.geometry.iter().map(Option::as_ref))
+                })
+                .flatten()
+                .map(|stats| stats.encode()),
         })
         .collect();
     out.sort_by_key(|g| g.column_id);
@@ -607,6 +625,9 @@ pub struct ColumnStats {
     /// Whether some value is not NULL, when `num_values` and `null_count` do
     /// not say.
     pub any_valid: bool,
+    /// A `geometry` column's bounding box and shapes (`extra_stats`), known only
+    /// while every value merged in had them.
+    pub geometry: Option<crate::geometry::GeometryStats>,
 }
 
 impl ColumnStats {
@@ -621,6 +642,10 @@ impl ColumnStats {
             num_values: None,
             contains_nan: stat.contains_nan,
             any_valid: stat.min_value.is_some() || stat.max_value.is_some(),
+            geometry: stat
+                .extra_stats
+                .as_deref()
+                .and_then(crate::geometry::GeometryStats::parse),
         }
     }
 
@@ -638,6 +663,10 @@ impl ColumnStats {
             num_values,
             contains_nan: stat.contains_nan,
             any_valid: true,
+            geometry: stat
+                .extra_stats
+                .as_deref()
+                .and_then(crate::geometry::GeometryStats::parse),
         }
     }
 
@@ -651,6 +680,8 @@ impl ColumnStats {
             num_values: None,
             contains_nan: None,
             any_valid: stat.any_valid,
+            // Rows written inline record no geometry bounds.
+            geometry: None,
         }
     }
 
@@ -693,9 +724,15 @@ impl ColumnStats {
         if !had_valid {
             self.min_value = new.min_value.clone();
             self.max_value = new.max_value.clone();
+            self.geometry = new.geometry.clone();
             self.any_valid = true;
             return;
         }
+        // A box covers the values only while every one merged in had one.
+        self.geometry = match (self.geometry.take(), &new.geometry) {
+            (Some(current), Some(new)) => Some(current.merge(new)),
+            _ => None,
+        };
         let widen = |stored: &mut Option<String>, value: &Option<String>, keep: Ordering| {
             *stored = match (stored.take(), value) {
                 (Some(current), Some(value)) => {
@@ -724,6 +761,10 @@ impl ColumnStats {
             max_value: stored(&self.max_value),
             contains_null: self.null_count.map(|nulls| nulls > 0),
             contains_nan: self.contains_nan,
+            extra_stats: self
+                .geometry
+                .as_ref()
+                .map(crate::geometry::GeometryStats::encode),
         }
     }
 }
@@ -1839,6 +1880,7 @@ mod tests {
             null_count,
             contains_nan: None,
             value_count: None,
+            extra_stats: None,
         }
     }
 
@@ -1892,7 +1934,8 @@ mod tests {
                 min_value: Some("9".to_string()),
                 max_value: Some("10".to_string()),
                 contains_null: Some(true),
-                contains_nan: None, // per-file contains_nan always None ⇒ unknown
+                contains_nan: None, // per-file contains_nan always None ⇒ unknown,
+                extra_stats: None,
             }]
         );
     }
@@ -1913,6 +1956,7 @@ mod tests {
                 max_value: None,
                 contains_null: None,
                 contains_nan: None,
+                extra_stats: None,
             }]
         );
     }
@@ -1937,6 +1981,7 @@ mod tests {
         bounds: Option<(&str, &str)>,
     ) -> GlobalColumnStat {
         GlobalColumnStat {
+            extra_stats: None,
             column_id,
             min_value: bounds.map(|b| b.0.to_string()),
             max_value: bounds.map(|b| b.1.to_string()),
@@ -1970,6 +2015,7 @@ mod tests {
         assert_eq!(
             merged,
             vec![GlobalColumnStat {
+                extra_stats: None,
                 column_id: 1,
                 min_value: Some("-2".to_string()),
                 max_value: Some("10".to_string()),
@@ -2029,6 +2075,7 @@ mod tests {
         assert_eq!(
             merged,
             vec![GlobalColumnStat {
+                extra_stats: None,
                 column_id: 1,
                 min_value: Some("3".to_string()),
                 max_value: Some("3".to_string()),
@@ -2164,6 +2211,7 @@ mod tests {
     fn file_stats_merge_as_official() {
         let file = |column_id: i64, bounds: Option<(&str, &str)>, values: i64, nulls: i64| {
             FileColumnStat {
+                extra_stats: None,
                 column_id,
                 min_value: bounds.map(|b| b.0.to_string()),
                 max_value: bounds.map(|b| b.1.to_string()),
@@ -2396,6 +2444,7 @@ mod merge_regression_tests {
     fn a_null_file_before_values_keeps_their_bounds() {
         let file = |min: Option<&str>, nulls: i64, values: i64| {
             vec![FileColumnStat {
+                extra_stats: None,
                 column_id: 2,
                 min_value: min.map(str::to_string),
                 max_value: min.map(str::to_string),
@@ -2422,6 +2471,7 @@ mod merge_regression_tests {
     #[test]
     fn a_nan_only_write_beside_unflagged_stats_leaves_no_row() {
         let nan_only = ColumnStats {
+            geometry: None,
             min_value: None,
             max_value: None,
             null_count: Some(0),
@@ -2430,6 +2480,7 @@ mod merge_regression_tests {
             any_valid: true,
         };
         let inlined = ColumnStats {
+            geometry: None,
             min_value: None,
             max_value: None,
             null_count: Some(1),
@@ -2451,6 +2502,7 @@ mod merge_regression_tests {
     fn a_boundless_nan_file_leaves_no_row() {
         let file = |bounds: Option<(&str, &str)>, nan: bool| {
             vec![FileColumnStat {
+                extra_stats: None,
                 column_id: 4,
                 min_value: bounds.map(|b| b.0.to_string()),
                 max_value: bounds.map(|b| b.1.to_string()),
@@ -2476,6 +2528,7 @@ mod merge_regression_tests {
     fn a_superseded_nul_bound_keeps_the_row() {
         let file = |min: &str, max: &str| {
             vec![FileColumnStat {
+                extra_stats: None,
                 column_id: 3,
                 min_value: Some(min.to_string()),
                 max_value: Some(max.to_string()),

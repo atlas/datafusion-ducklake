@@ -1782,7 +1782,7 @@ async fn schedule_compaction_files(
 /// every commit, and against a networked Postgres the round trip dominates the
 /// work — a wide table otherwise pays one round trip per column. Passing the
 /// columns as arrays (rather than a generated `VALUES` list) keeps the bind
-/// count fixed at nine, so a table cannot approach Postgres's 65535-parameter
+/// count fixed at ten, so a table cannot approach Postgres's 65535-parameter
 /// ceiling however many columns it has.
 async fn insert_file_column_stats(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -1804,17 +1804,18 @@ async fn insert_file_column_stats(
     let mins: Vec<Option<String>> = column_stats.iter().map(|s| stored(&s.min_value)).collect();
     let maxes: Vec<Option<String>> = column_stats.iter().map(|s| stored(&s.max_value)).collect();
     let nans: Vec<Option<bool>> = column_stats.iter().map(|s| s.contains_nan).collect();
+    let extras: Vec<Option<String>> = column_stats.iter().map(|s| s.extra_stats.clone()).collect();
 
     sqlx::query(
         "INSERT INTO ducklake_file_column_stats
              (data_file_id, table_id, column_id, column_size_bytes,
               value_count, null_count, min_value, max_value, contains_nan, extra_stats)
          SELECT $1, $2, u.column_id, u.column_size_bytes,
-                u.value_count, u.null_count, u.min_value, u.max_value, u.contains_nan, NULL
+                u.value_count, u.null_count, u.min_value, u.max_value, u.contains_nan, u.extra_stats
          FROM UNNEST($3::bigint[], $4::bigint[], $5::bigint[], $6::bigint[],
-                     $7::text[], $8::text[], $9::boolean[])
+                     $7::text[], $8::text[], $9::boolean[], $10::text[])
               AS u(column_id, column_size_bytes, value_count, null_count,
-                   min_value, max_value, contains_nan)",
+                   min_value, max_value, contains_nan, extra_stats)",
     )
     .bind(data_file_id)
     .bind(table_id)
@@ -1825,6 +1826,7 @@ async fn insert_file_column_stats(
     .bind(&mins)
     .bind(&maxes)
     .bind(&nans)
+    .bind(&extras)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -2114,7 +2116,8 @@ async fn load_table_column_stats(
 ) -> Result<Vec<crate::stats_encode::GlobalColumnStat>> {
     let mut existing = Vec::new();
     for row in sqlx::query(
-        "SELECT s.column_id, s.contains_null, s.contains_nan, s.min_value, s.max_value
+        "SELECT s.column_id, s.contains_null, s.contains_nan, s.min_value, s.max_value,
+                s.extra_stats
          FROM ducklake_table_column_stats s
          WHERE s.table_id = $1
            AND NOT (s.min_value IS NULL AND s.max_value IS NULL
@@ -2140,6 +2143,7 @@ async fn load_table_column_stats(
             contains_nan: row.try_get(2)?,
             min_value: row.try_get(3)?,
             max_value: row.try_get(4)?,
+            extra_stats: row.try_get(5)?,
         });
     }
     Ok(existing)
@@ -2151,17 +2155,6 @@ async fn store_table_column_stats(
     table_id: i64,
     globals: Vec<crate::stats_encode::GlobalColumnStat>,
 ) -> Result<()> {
-    // A kept row keeps its `extra_stats` (a `GEOMETRY` column's bounds), which
-    // this crate does not compute.
-    let extra: std::collections::HashMap<i64, String> = sqlx::query_as(
-        "SELECT column_id, extra_stats FROM ducklake_table_column_stats
-         WHERE table_id = $1 AND extra_stats IS NOT NULL",
-    )
-    .bind(table_id)
-    .fetch_all(&mut **tx)
-    .await?
-    .into_iter()
-    .collect();
     sqlx::query("DELETE FROM ducklake_table_column_stats WHERE table_id = $1")
         .bind(table_id)
         .execute(&mut **tx)
@@ -2177,10 +2170,7 @@ async fn store_table_column_stats(
     let contains_nan: Vec<Option<bool>> = globals.iter().map(|g| g.contains_nan).collect();
     let mins: Vec<Option<String>> = globals.iter().map(|g| g.min_value.clone()).collect();
     let maxes: Vec<Option<String>> = globals.iter().map(|g| g.max_value.clone()).collect();
-    let extras: Vec<Option<String>> = globals
-        .iter()
-        .map(|g| extra.get(&g.column_id).cloned())
-        .collect();
+    let extras: Vec<Option<String>> = globals.iter().map(|g| g.extra_stats.clone()).collect();
 
     sqlx::query(
         "INSERT INTO ducklake_table_column_stats

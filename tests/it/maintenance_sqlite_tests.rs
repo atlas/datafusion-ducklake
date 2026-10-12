@@ -1224,6 +1224,7 @@ async fn expire_leaves_no_stats_behind_for_a_retired_file_id() {
                 value_count: Some(5),
                 contains_nan: None,
                 column_size_bytes: Some(64),
+                extra_stats: None,
             })
             .collect()
     };

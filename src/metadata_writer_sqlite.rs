@@ -2587,7 +2587,7 @@ async fn insert_file_column_stats(
             "INSERT INTO ducklake_file_column_stats
                  (data_file_id, table_id, column_id, column_size_bytes,
                   value_count, null_count, min_value, max_value, contains_nan, extra_stats)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(data_file_id)
         .bind(table_id)
@@ -2598,6 +2598,7 @@ async fn insert_file_column_stats(
         .bind(stat.min_value.as_deref())
         .bind(stat.max_value.as_deref())
         .bind(stat.contains_nan)
+        .bind(stat.extra_stats.as_deref())
         .execute(&mut **tx)
         .await?;
     }
@@ -2659,7 +2660,8 @@ async fn load_table_column_stats(
 ) -> Result<Vec<crate::stats_encode::GlobalColumnStat>> {
     let mut existing = Vec::new();
     for row in sqlx::query(
-        "SELECT s.column_id, s.contains_null, s.contains_nan, s.min_value, s.max_value
+        "SELECT s.column_id, s.contains_null, s.contains_nan, s.min_value, s.max_value,
+                s.extra_stats
          FROM ducklake_table_column_stats s
          WHERE s.table_id = ?
            AND NOT (s.min_value IS NULL AND s.max_value IS NULL
@@ -2685,6 +2687,7 @@ async fn load_table_column_stats(
             contains_nan: row.try_get(2)?,
             min_value: row.try_get(3)?,
             max_value: row.try_get(4)?,
+            extra_stats: row.try_get(5)?,
         });
     }
     Ok(existing)
@@ -2696,17 +2699,6 @@ async fn store_table_column_stats(
     table_id: i64,
     globals: Vec<crate::stats_encode::GlobalColumnStat>,
 ) -> Result<()> {
-    // A kept row keeps its `extra_stats` (a `GEOMETRY` column's bounds), which
-    // this crate does not compute.
-    let extra: std::collections::HashMap<i64, String> = sqlx::query_as(
-        "SELECT column_id, extra_stats FROM ducklake_table_column_stats
-         WHERE table_id = ? AND extra_stats IS NOT NULL",
-    )
-    .bind(table_id)
-    .fetch_all(&mut **tx)
-    .await?
-    .into_iter()
-    .collect();
     sqlx::query("DELETE FROM ducklake_table_column_stats WHERE table_id = ?")
         .bind(table_id)
         .execute(&mut **tx)
@@ -2723,7 +2715,7 @@ async fn store_table_column_stats(
         .bind(g.contains_nan)
         .bind(g.min_value)
         .bind(g.max_value)
-        .bind(extra.get(&g.column_id))
+        .bind(g.extra_stats)
         .execute(&mut **tx)
         .await?;
     }
@@ -8763,6 +8755,7 @@ mod tests {
                 value_count: Some(3),
                 contains_nan: None,
                 column_size_bytes: None,
+                extra_stats: None,
             },
             ColumnStat {
                 column_id: 2,
@@ -8772,6 +8765,7 @@ mod tests {
                 value_count: Some(2),
                 contains_nan: None,
                 column_size_bytes: None,
+                extra_stats: None,
             },
         ]);
         writer
@@ -8856,6 +8850,7 @@ mod tests {
                 value_count: Some(vals),
                 contains_nan: None,
                 column_size_bytes: None,
+                extra_stats: None,
             }]
         };
 
@@ -8927,6 +8922,7 @@ mod tests {
                     value_count: Some(3),
                     contains_nan: None,
                     column_size_bytes: None,
+                    extra_stats: None,
                 }]),
                 WriteMode::Append,
                 0,

@@ -138,3 +138,53 @@ async fn a_commit_lock_does_not_block_another_lake() {
         .expect("the same table identity in another lake waited for this lake's lock")
         .unwrap();
 }
+
+/// DuckDB attaches a lake this writer made in its own schema and reads what
+/// was written, which it can do only if the catalog has DuckLake 1.0's layout.
+#[cfg(feature = "metadata-duckdb")]
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn duckdb_reads_a_lake_in_its_schema() {
+    let (pool, container) = database().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let data = TempDir::new().unwrap();
+    lake(&pool, "tenant_a", &data);
+    sql(
+        &pool,
+        "tenant_a",
+        "CREATE TABLE lake.main.t (id BIGINT, name VARCHAR)",
+    )
+    .await;
+    sql(
+        &pool,
+        "tenant_a",
+        "INSERT INTO lake.main.t VALUES (1, 'one'), (2, 'two')",
+    )
+    .await;
+    sql(
+        &pool,
+        "tenant_a",
+        "INSERT INTO lake.main.t VALUES (3, 'three')",
+    )
+    .await;
+
+    crate::common::ensure_ducklake_installed();
+    let duckdb = duckdb::Connection::open_in_memory().unwrap();
+    duckdb
+        .execute_batch("INSTALL postgres; LOAD postgres; LOAD ducklake;")
+        .unwrap();
+    duckdb
+        .execute_batch(&format!(
+            "ATTACH 'ducklake:postgres:host=127.0.0.1 port={port} dbname=postgres \
+             user=postgres password=postgres' AS lake (METADATA_SCHEMA 'tenant_a', READ_ONLY)"
+        ))
+        .unwrap();
+    let (rows, ids, names): (i64, i64, String) = duckdb
+        .query_row(
+            "SELECT count(*), sum(id), string_agg(name, ',' ORDER BY id) FROM lake.main.t",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((rows, ids, names.as_str()), (3, 6, "one,two,three"));
+}

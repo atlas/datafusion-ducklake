@@ -1,6 +1,14 @@
 //! Single-catalog PostgreSQL implementation of [`MetadataWriter`] — the standard,
 //! spec-compliant DuckLake layout, readable by DuckDB's `ducklake` extension.
 //!
+//! The layout is DuckLake 1.0's: schema and table ids share one catalog-id space
+//! and data and delete file ids one file-id space, each a sequence, and every
+//! snapshot records where both stood when it was taken. A catalog created by an
+//! earlier version of this writer is upgraded in place by `initialize_schema`.
+//! Readers, DuckDB included, can read the lake; DuckDB must not write to it,
+//! because its allocator trusts the snapshot watermarks and this writer draws ids
+//! after taking the snapshot.
+//!
 //! Separate from [`crate::metadata_writer_postgres::PostgresMetadataWriter`], which
 //! writes this crate's multicatalog layout (`catalog_id` columns plus
 //! `ducklake_catalog*` map tables) and is not part of the DuckLake spec.
@@ -48,6 +56,13 @@ const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 /// the SQLite and MySQL writers (and so upstream); only the SQL types differ. Split
 /// one per entry because sqlx runs each `query()` as a single prepared statement.
 const SQL_CREATE_TABLES: &[&str] = &[
+    // `md5(...)::uuid` stands in for `gen_random_uuid()`, which needs PostgreSQL 13.
+    // DuckLake 1.0 draws schema, table and view ids from one catalog-id space and
+    // data and delete file ids from one file-id space, and records where each
+    // space stands on every snapshot (`next_catalog_id`, `next_file_id`). These
+    // sequences are those spaces; DuckDB ignores objects it does not know.
+    "CREATE SEQUENCE IF NOT EXISTS ducklake_catalog_id_seq",
+    "CREATE SEQUENCE IF NOT EXISTS ducklake_file_id_seq",
     SQL_CREATE_INLINED_DATA_TABLES,
     r#"CREATE TABLE IF NOT EXISTS ducklake_metadata (
         key VARCHAR NOT NULL,
@@ -58,7 +73,9 @@ const SQL_CREATE_TABLES: &[&str] = &[
     r#"CREATE TABLE IF NOT EXISTS ducklake_snapshot (
         snapshot_id BIGINT NOT NULL PRIMARY KEY,
         snapshot_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        schema_version BIGINT NOT NULL DEFAULT 0
+        schema_version BIGINT NOT NULL DEFAULT 0,
+        next_catalog_id BIGINT,
+        next_file_id BIGINT
     )"#,
     // Per-snapshot change summary + commit metadata (DuckLake spec). `insert_snapshot`
     // seeds one row per snapshot with `changes_made` NULL; the commit paths fill it in
@@ -77,7 +94,8 @@ const SQL_CREATE_TABLES: &[&str] = &[
         UNIQUE (table_id, begin_snapshot)
     )"#,
     r#"CREATE TABLE IF NOT EXISTS ducklake_schema (
-        schema_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        schema_id BIGINT PRIMARY KEY DEFAULT nextval('ducklake_catalog_id_seq'),
+        schema_uuid UUID DEFAULT md5(random()::text || clock_timestamp()::text)::uuid,
         schema_name VARCHAR NOT NULL,
         path VARCHAR NOT NULL DEFAULT '',
         path_is_relative BOOLEAN NOT NULL DEFAULT TRUE,
@@ -85,7 +103,8 @@ const SQL_CREATE_TABLES: &[&str] = &[
         end_snapshot BIGINT
     )"#,
     r#"CREATE TABLE IF NOT EXISTS ducklake_table (
-        table_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        table_id BIGINT PRIMARY KEY DEFAULT nextval('ducklake_catalog_id_seq'),
+        table_uuid UUID DEFAULT md5(random()::text || clock_timestamp()::text)::uuid,
         schema_id BIGINT NOT NULL,
         table_name VARCHAR NOT NULL,
         path VARCHAR NOT NULL DEFAULT '',
@@ -123,8 +142,9 @@ const SQL_CREATE_TABLES: &[&str] = &[
         default_value_dialect VARCHAR
     )"#,
     r#"CREATE TABLE IF NOT EXISTS ducklake_data_file (
-        data_file_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        data_file_id BIGINT PRIMARY KEY DEFAULT nextval('ducklake_file_id_seq'),
         table_id BIGINT NOT NULL,
+        file_order BIGINT,
         path VARCHAR NOT NULL,
         path_is_relative BOOLEAN NOT NULL DEFAULT TRUE,
         file_size_bytes BIGINT NOT NULL,
@@ -135,7 +155,9 @@ const SQL_CREATE_TABLES: &[&str] = &[
         mapping_id BIGINT,
         begin_snapshot BIGINT NOT NULL,
         end_snapshot BIGINT,
-        partition_id BIGINT
+        partition_id BIGINT,
+        file_format VARCHAR DEFAULT 'parquet',
+        partial_max BIGINT
     )"#,
     // Per-table row-lineage + running totals. `next_row_id` allocates rowids
     // monotonically over the table's lifetime; `record_count`/`file_size_bytes`
@@ -173,7 +195,7 @@ const SQL_CREATE_TABLES: &[&str] = &[
     // Created for catalog-shape parity and so the provider's LEFT JOINs resolve;
     // this writer never inserts delete files (`set_delete_file` is unsupported).
     r#"CREATE TABLE IF NOT EXISTS ducklake_delete_file (
-        delete_file_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        delete_file_id BIGINT PRIMARY KEY DEFAULT nextval('ducklake_file_id_seq'),
         data_file_id BIGINT NOT NULL,
         table_id BIGINT NOT NULL,
         path VARCHAR NOT NULL,
@@ -183,7 +205,9 @@ const SQL_CREATE_TABLES: &[&str] = &[
         encryption_key VARCHAR,
         delete_count BIGINT,
         begin_snapshot BIGINT NOT NULL,
-        end_snapshot BIGINT
+        end_snapshot BIGINT,
+        format VARCHAR DEFAULT 'parquet',
+        partial_max BIGINT
     )"#,
     r#"CREATE TABLE IF NOT EXISTS ducklake_files_scheduled_for_deletion (
         data_file_id BIGINT NOT NULL,
@@ -264,6 +288,116 @@ const SQL_CREATE_TABLES: &[&str] = &[
         key VARCHAR,
         value VARCHAR
     )"#,
+    // DuckLake 1.0 tables this writer does not fill. DuckDB reads them when it
+    // attaches, so they must exist.
+    r#"CREATE TABLE IF NOT EXISTS ducklake_column_mapping (
+        mapping_id BIGINT,
+        table_id BIGINT,
+        type VARCHAR
+    )"#,
+    r#"CREATE TABLE IF NOT EXISTS ducklake_name_mapping (
+        mapping_id BIGINT,
+        column_id BIGINT,
+        source_name VARCHAR,
+        target_field_id BIGINT,
+        parent_column BIGINT,
+        is_partition BOOLEAN
+    )"#,
+    r#"CREATE TABLE IF NOT EXISTS ducklake_macro (
+        schema_id BIGINT,
+        macro_id BIGINT,
+        macro_name VARCHAR,
+        begin_snapshot BIGINT,
+        end_snapshot BIGINT
+    )"#,
+    r#"CREATE TABLE IF NOT EXISTS ducklake_macro_impl (
+        macro_id BIGINT,
+        impl_id BIGINT,
+        dialect VARCHAR,
+        sql VARCHAR,
+        type VARCHAR
+    )"#,
+    r#"CREATE TABLE IF NOT EXISTS ducklake_macro_parameters (
+        macro_id BIGINT,
+        impl_id BIGINT,
+        column_id BIGINT,
+        parameter_name VARCHAR,
+        parameter_type VARCHAR,
+        default_value VARCHAR,
+        default_value_type VARCHAR
+    )"#,
+    r#"CREATE TABLE IF NOT EXISTS ducklake_file_variant_stats (
+        data_file_id BIGINT,
+        table_id BIGINT,
+        column_id BIGINT,
+        variant_path VARCHAR,
+        shredded_type VARCHAR,
+        column_size_bytes BIGINT,
+        value_count BIGINT,
+        null_count BIGINT,
+        min_value VARCHAR,
+        max_value VARCHAR,
+        contains_nan BOOLEAN,
+        extra_stats VARCHAR
+    )"#,
+];
+
+/// Brings a catalog this writer created before DuckLake 1.0 up to it. Each
+/// statement is idempotent, so `initialize_schema` runs them on every open.
+const SQL_UPGRADE_TO_1_0: &[&str] = &[
+    "ALTER TABLE ducklake_snapshot
+         ADD COLUMN IF NOT EXISTS next_catalog_id BIGINT,
+         ADD COLUMN IF NOT EXISTS next_file_id BIGINT",
+    "ALTER TABLE ducklake_schema ADD COLUMN IF NOT EXISTS schema_uuid UUID DEFAULT md5(random()::text || clock_timestamp()::text)::uuid",
+    "ALTER TABLE ducklake_table ADD COLUMN IF NOT EXISTS table_uuid UUID DEFAULT md5(random()::text || clock_timestamp()::text)::uuid",
+    "ALTER TABLE ducklake_data_file
+         ADD COLUMN IF NOT EXISTS file_order BIGINT,
+         ADD COLUMN IF NOT EXISTS file_format VARCHAR DEFAULT 'parquet',
+         ADD COLUMN IF NOT EXISTS partial_max BIGINT",
+    "ALTER TABLE ducklake_delete_file
+         ADD COLUMN IF NOT EXISTS format VARCHAR DEFAULT 'parquet',
+         ADD COLUMN IF NOT EXISTS partial_max BIGINT",
+    // Ids drawn from per-table IDENTITY sequences move to the shared spaces.
+    "ALTER TABLE ducklake_schema ALTER COLUMN schema_id DROP IDENTITY IF EXISTS,
+         ALTER COLUMN schema_id SET DEFAULT nextval('ducklake_catalog_id_seq')",
+    "ALTER TABLE ducklake_table ALTER COLUMN table_id DROP IDENTITY IF EXISTS,
+         ALTER COLUMN table_id SET DEFAULT nextval('ducklake_catalog_id_seq')",
+    "ALTER TABLE ducklake_data_file ALTER COLUMN data_file_id DROP IDENTITY IF EXISTS,
+         ALTER COLUMN data_file_id SET DEFAULT nextval('ducklake_file_id_seq')",
+    "ALTER TABLE ducklake_delete_file ALTER COLUMN delete_file_id DROP IDENTITY IF EXISTS,
+         ALTER COLUMN delete_file_id SET DEFAULT nextval('ducklake_file_id_seq')",
+    // Start each space past every id already used, by this writer or by DuckDB
+    // (whose watermark can be ahead of the largest id). Never moves a sequence
+    // back, so a re-open is a no-op.
+    "SELECT setval('ducklake_catalog_id_seq', used) FROM (
+         SELECT GREATEST(
+             (SELECT MAX(schema_id) FROM ducklake_schema),
+             (SELECT MAX(table_id) FROM ducklake_table),
+             (SELECT MAX(view_id) FROM ducklake_view),
+             (SELECT MAX(next_catalog_id) - 1 FROM ducklake_snapshot)) AS used) ids
+     WHERE used >= (SELECT CASE WHEN is_called THEN last_value + 1 ELSE last_value END
+                    FROM ducklake_catalog_id_seq)",
+    "SELECT setval('ducklake_file_id_seq', used) FROM (
+         SELECT GREATEST(
+             (SELECT MAX(data_file_id) FROM ducklake_data_file),
+             (SELECT MAX(delete_file_id) FROM ducklake_delete_file),
+             (SELECT MAX(next_file_id) - 1 FROM ducklake_snapshot)) AS used) ids
+     WHERE used >= (SELECT CASE WHEN is_called THEN last_value + 1 ELSE last_value END
+                    FROM ducklake_file_id_seq)",
+    // DuckDB reads both watermarks of every snapshot and fails on NULL.
+    "UPDATE ducklake_snapshot s SET
+         next_catalog_id = GREATEST(
+             (SELECT MAX(schema_id) FROM ducklake_schema WHERE begin_snapshot <= s.snapshot_id),
+             (SELECT MAX(table_id) FROM ducklake_table WHERE begin_snapshot <= s.snapshot_id),
+             -1) + 1,
+         next_file_id = GREATEST(
+             (SELECT MAX(data_file_id) FROM ducklake_data_file WHERE begin_snapshot <= s.snapshot_id),
+             (SELECT MAX(delete_file_id) FROM ducklake_delete_file WHERE begin_snapshot <= s.snapshot_id),
+             -1) + 1
+     WHERE s.next_catalog_id IS NULL OR s.next_file_id IS NULL",
+    "INSERT INTO ducklake_metadata (key, value, scope)
+     SELECT 'version', '1.0', NULL
+     WHERE NOT EXISTS (SELECT 1 FROM ducklake_metadata WHERE key = 'version' AND scope IS NULL)",
 ];
 
 /// Single-catalog PostgreSQL metadata writer for standard DuckLake catalogs.
@@ -347,22 +481,18 @@ async fn reserve_ids(
     Ok(last)
 }
 
-/// Take one id from the sequence backing an IDENTITY column without inserting a row,
-/// so `begin_write_transaction` can hand out a schema/table id that only becomes a
+/// Take one id from an id-space sequence without inserting a row, so
+/// `begin_write_transaction` can hand out a schema/table id that only becomes a
 /// visible row at commit. Sequences are non-transactional, so an unused reservation
 /// just leaves a gap.
 async fn reserve_identity(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    table: &str,
-    column: &str,
+    sequence: &str,
 ) -> Result<i64> {
-    Ok(
-        sqlx::query_scalar("SELECT nextval(pg_get_serial_sequence($1, $2))")
-            .bind(table)
-            .bind(column)
-            .fetch_one(&mut **tx)
-            .await?,
-    )
+    Ok(sqlx::query_scalar("SELECT nextval($1::regclass)")
+        .bind(sequence)
+        .fetch_one(&mut **tx)
+        .await?)
 }
 
 /// Seed an id counter from the current MAX of its backing column, so a pre-existing
@@ -471,9 +601,18 @@ async fn insert_snapshot(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Resu
             .fetch_one(&mut **tx)
             .await?
             .try_get(0)?;
+    // The watermarks are where each id space stands as the snapshot is taken.
+    // Ids this commit draws later are above them, so they bound every id an
+    // earlier snapshot can see, which is what a reader needs. A writer that
+    // allocates from them, like DuckDB, must not share a lake with this one.
     sqlx::query(
-        "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time, schema_version)
-         VALUES ($1, NOW(), $2)",
+        "INSERT INTO ducklake_snapshot
+             (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id)
+         SELECT $1, NOW(), $2,
+             (SELECT CASE WHEN is_called THEN last_value + 1 ELSE last_value END
+              FROM ducklake_catalog_id_seq),
+             (SELECT CASE WHEN is_called THEN last_value + 1 ELSE last_value END
+              FROM ducklake_file_id_seq)",
     )
     .bind(snapshot_id)
     .bind(schema_version)
@@ -885,8 +1024,7 @@ async fn finalize_table_snapshot(
         };
 
     // A new table keeps the id reserved at begin: the caller already holds it in
-    // `WriteSetupResult` and passes it back here. `table_id` is IDENTITY, hence
-    // OVERRIDING SYSTEM VALUE.
+    // `WriteSetupResult` and passes it back here.
     let table_id: i64 = match sqlx::query_scalar(
         "SELECT table_id FROM ducklake_table
          WHERE schema_id = $1 AND table_name = $2 AND end_snapshot IS NULL",
@@ -901,7 +1039,6 @@ async fn finalize_table_snapshot(
             sqlx::query(
                 "INSERT INTO ducklake_table
                      (table_id, schema_id, table_name, path, path_is_relative, begin_snapshot)
-                 OVERRIDING SYSTEM VALUE
                  VALUES ($1, $2, $3, $4, TRUE, $5)",
             )
             .bind(table_id_hint)
@@ -2341,6 +2478,9 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             for ddl in SQL_CREATE_TABLES {
                 sqlx::query(*ddl).execute(&self.pool).await?;
             }
+            for upgrade in SQL_UPGRADE_TO_1_0 {
+                sqlx::query(*upgrade).execute(&self.pool).await?;
+            }
             sqlx::query("ALTER TABLE ducklake_metadata ADD COLUMN IF NOT EXISTS scope VARCHAR")
                 .execute(&self.pool)
                 .await?;
@@ -2441,7 +2581,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             // from the counter, so under concurrency it may differ from this.
             let snapshot_id: i64 = base_snapshot_id + 1;
 
-            // Look up, do NOT create. Reserving from the IDENTITY sequence hands out
+            // Look up, do NOT create. Reserving from the catalog-id sequence hands out
             // an id without inserting a row, so a write that dies before commit
             // leaves nothing behind — schema/table visibility is
             // `snapshot >= begin_snapshot` with no check that the snapshot exists,
@@ -2457,7 +2597,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .await?
             {
                 Some(id) => id,
-                None => reserve_identity(&mut tx, "ducklake_schema", "schema_id").await?,
+                None => reserve_identity(&mut tx, "ducklake_catalog_id_seq").await?,
             };
 
             let table_id: i64 = match sqlx::query_scalar(
@@ -2472,7 +2612,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .await?
             {
                 Some(id) => id,
-                None => reserve_identity(&mut tx, "ducklake_table", "table_id").await?,
+                None => reserve_identity(&mut tx, "ducklake_catalog_id_seq").await?,
             };
 
             // Get existing columns to (a) check schema compatibility for appends

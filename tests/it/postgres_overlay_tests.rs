@@ -701,3 +701,29 @@ async fn a_write_that_read_a_stale_overlay_conflicts() {
         expected(&[(2, "b")])
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_write_conflicts_with_a_change_to_the_overlay_table_alone() {
+    let lake = Lake::start().await;
+    lake.write("t", &[1, 2], &["a", "b"]).await;
+    lake.create("o").await;
+    // Only hides underlay rows, so stages nothing in the overlay table.
+    let stale = lake.writable_overlay("o").await;
+    lake.change("o", "INSERT INTO ov VALUES (3, 'c')")
+        .await
+        .unwrap();
+    let before = lake.head().await;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("ov", Arc::new(stale)).unwrap();
+    let error = match ctx.sql("DELETE FROM ov WHERE id = 1").await {
+        Ok(frame) => frame.collect().await.expect_err("a stale write conflicts"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().to_lowercase().contains("conflict"),
+        "{error}"
+    );
+    assert_eq!(lake.head().await, before, "a conflict commits nothing");
+}

@@ -213,6 +213,7 @@ pub async fn rebase_overlay(
             overlay_table_id: overlay.table_id(),
             create: None,
             rebase: Some(plan.new_base),
+            merge: false,
             hide,
             hide_inlined,
             fold: Vec::new(),

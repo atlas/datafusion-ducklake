@@ -1530,11 +1530,39 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 expected_base_snapshot_id,
             )
             .await?;
+            if overlay.merge {
+                // The underlay gained files and delete files, whose column
+                // statistics the merge rolled up: record its changes.
+                let underlay: i64 = sqlx::query_scalar(
+                    "SELECT underlay_table_id FROM ducklake_overlay
+                     WHERE overlay_table_id = $1 AND end_snapshot = $2",
+                )
+                .bind(overlay_table_id)
+                .bind(snapshot_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                // It ended the underlay's inlined rows the overlay hid.
+                let ended_inline: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM ducklake_overlay_inlined_row_delete
+                         WHERE overlay_table_id = $1 AND end_snapshot = $2)",
+                )
+                .bind(overlay_table_id)
+                .bind(snapshot_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                let mut changes =
+                    format!("inserted_into_table:{underlay},deleted_from_table:{underlay}");
+                if ended_inline {
+                    changes.push_str(&format!(",inlined_delete:{underlay}"));
+                }
+                record_snapshot_changes(&mut tx, snapshot_id, &changes, commit_metadata).await?;
+            }
             if !overlay.hide.is_empty()
                 || !overlay.hide_inlined.is_empty()
                 || !overlay.fold.is_empty()
                 || overlay.create.is_some()
                 || overlay.rebase.is_some()
+                || overlay.merge
             {
                 record_snapshot_changes(
                     &mut tx,

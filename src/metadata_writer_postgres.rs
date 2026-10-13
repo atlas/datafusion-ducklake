@@ -2063,7 +2063,7 @@ async fn insert_partition_metadata(
 
 /// The field ids and DuckLake types of the table's live columns and nested
 /// fields, by which the table-wide statistics merge compares bounds.
-async fn live_stat_fields(
+pub(crate) async fn live_stat_fields(
     table_id: i64,
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<Vec<(i64, String)>> {

@@ -272,6 +272,7 @@ impl OverlayStatement {
             .commit_overlay(&OverlayCommit {
                 overlay_table_id: self.overlay_table_id,
                 create: None,
+                rebase: None,
                 hide,
                 hide_inlined,
                 fold: Vec::new(),

@@ -74,6 +74,10 @@ pub struct OverlayCommit {
     /// Make the table an overlay of `(underlay_table_id, base_snapshot)` in
     /// this snapshot. The table must not be an overlay already.
     pub create: Option<(i64, i64)>,
+    /// Move the base to this underlay snapshot, no earlier than the current
+    /// one. Everything hidden at the old base stops being hidden; `hide` then
+    /// names positions at the new base.
+    pub rebase: Option<i64>,
     /// Underlay positions the overlay starts to hide. Each must be in an
     /// underlay data file live at the base, and not hidden already.
     pub hide: Vec<DuckLakeInlinedDelete>,
@@ -582,6 +586,16 @@ impl DuckLakeOverlayTable {
     pub fn base(&self) -> &Arc<OverlayBase> {
         &self.base
     }
+
+    /// The underlay at the base, as the overlay reads it.
+    pub(crate) fn underlay(&self) -> &DuckLakeTable {
+        &self.underlay
+    }
+
+    /// The overlay's own table.
+    pub(crate) fn overlay(&self) -> &DuckLakeTable {
+        &self.overlay
+    }
 }
 
 #[async_trait]
@@ -758,6 +772,7 @@ pub async fn create_overlay(
         .commit_overlay(&OverlayCommit {
             overlay_table_id: staged,
             create: Some((underlay.table_id(), underlay.snapshot())),
+            rebase: None,
             hide: Vec::new(),
             hide_inlined: Vec::new(),
             fold: Vec::new(),
@@ -869,6 +884,7 @@ pub async fn flush_overlay(
         .commit_overlay(&OverlayCommit {
             overlay_table_id: table.overlay.table_id(),
             create: None,
+            rebase: None,
             hide: Vec::new(),
             hide_inlined: Vec::new(),
             fold,
@@ -876,3 +892,6 @@ pub async fn flush_overlay(
         .await?;
     Ok(Some(snapshot_id))
 }
+
+#[cfg(feature = "write")]
+pub use crate::overlay_rebase::{OverlayRebase, plan_rebase, rebase_overlay};

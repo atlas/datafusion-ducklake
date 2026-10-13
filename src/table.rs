@@ -4652,6 +4652,11 @@ impl DuckLakeTable {
         self
     }
 
+    /// The catalog's columns at this table's snapshot, nested ones included.
+    pub(crate) fn fields(&self) -> &[DuckLakeTableField] {
+        &self.fields
+    }
+
     /// This table's catalog `table_id`. Used by the compaction commit and the snapshot
     /// consistency rule.
     pub(crate) fn table_id(&self) -> i64 {

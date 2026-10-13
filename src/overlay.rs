@@ -74,6 +74,8 @@ pub struct OverlayCommit {
     /// Make the table an overlay of `(underlay_table_id, base_snapshot)` in
     /// this snapshot. The table must not be an overlay already.
     pub create: Option<(i64, i64)>,
+    /// Merge the overlay into its underlay and close it (see [`merge_overlay`]).
+    pub merge: bool,
     /// Move the base to this underlay snapshot, no earlier than the current
     /// one. Everything hidden at the old base stops being hidden; `hide` then
     /// names positions at the new base.
@@ -766,6 +768,10 @@ impl DuckLakeOverlayTable {
 /// Creates `schema_name.table_name` with `underlay`'s columns and makes it an
 /// overlay of `underlay` at the snapshot `underlay` was read at, in one
 /// snapshot. Returns that snapshot and the overlay table's id.
+///
+/// The overlay table's columns take the underlay's column ids, which DuckLake
+/// scopes to a table, so the overlay table's files are files of the underlay
+/// too and a merge registers them as they are.
 #[cfg(feature = "write")]
 pub async fn create_overlay(
     table_writer: &crate::table_writer::DuckLakeTableWriter,
@@ -774,13 +780,19 @@ pub async fn create_overlay(
     underlay: &DuckLakeTable,
 ) -> Result<(i64, i64)> {
     let mut transaction = table_writer.transaction();
-    let staged =
-        transaction.stage_table(schema_name, table_name, underlay.data_schema().as_ref())?;
+    let paths = column_paths(underlay.fields());
+    let staged = transaction.stage_table_with_column_ids(
+        schema_name,
+        table_name,
+        underlay.data_schema().as_ref(),
+        |path| paths.get(path).copied(),
+    )?;
     let (snapshot_id, tables) = transaction
         .commit_overlay(&OverlayCommit {
             overlay_table_id: staged,
             create: Some((underlay.table_id(), underlay.snapshot())),
             rebase: None,
+            merge: false,
             hide: Vec::new(),
             hide_inlined: Vec::new(),
             fold: Vec::new(),
@@ -893,6 +905,7 @@ pub async fn flush_overlay(
             overlay_table_id: table.overlay.table_id(),
             create: None,
             rebase: None,
+            merge: false,
             hide: Vec::new(),
             hide_inlined: Vec::new(),
             fold,
@@ -903,3 +916,81 @@ pub async fn flush_overlay(
 
 #[cfg(feature = "write")]
 pub use crate::overlay_rebase::{OverlayRebase, plan_rebase, rebase_overlay};
+
+/// Each column's path, its name and its parents' from the top-level column
+/// down, to its id.
+#[cfg(feature = "write")]
+fn column_paths(
+    fields: &[crate::metadata_provider::DuckLakeTableField],
+) -> HashMap<Vec<String>, i64> {
+    let by_id = fields
+        .iter()
+        .map(|field| (field.column_id, field))
+        .collect::<HashMap<_, _>>();
+    fields
+        .iter()
+        .map(|field| {
+            let mut path = vec![field.column_name.clone()];
+            let mut parent = field.parent_column;
+            while let Some(id) = parent {
+                let Some(node) = by_id.get(&id) else {
+                    break;
+                };
+                path.push(node.column_name.clone());
+                parent = node.parent_column;
+            }
+            path.reverse();
+            (path, field.column_id)
+        })
+        .collect()
+}
+
+/// Merges `table` into its underlay in one snapshot and closes the overlay.
+///
+/// The underlay's delete files for the data files the overlay hides rows of
+/// become the overlay's delete files, which already hold the underlay's
+/// deletes at the base, and the overlay table's live files, each with its
+/// delete file, become files of the underlay. No data is copied.
+///
+/// The overlay must be flushed ([`flush_overlay`]), its base must be the
+/// underlay's head (rebase first, [`rebase_overlay`]), and `table` must be
+/// read at the overlay's head: the commit conflicts if the underlay changed
+/// since the base or the overlay since `table` was read. The overlay stays
+/// readable at earlier snapshots. Returns the snapshot.
+#[cfg(feature = "write")]
+pub async fn merge_overlay(
+    table: &DuckLakeOverlayTable,
+    table_writer: &crate::table_writer::DuckLakeTableWriter,
+) -> Result<i64> {
+    let inlined = table.overlay.inlined_data_with_row_ids()?;
+    let deleted_inline = table
+        .overlay
+        .inlined_deletes_by_file()
+        .map_err(|error| DuckLakeError::Internal(error.to_string()))?;
+    if !table.base.inlined_deletes.is_empty()
+        || inlined.iter().any(|data| data.batch.num_rows() > 0)
+        || deleted_inline
+            .values()
+            .any(|positions| !positions.is_empty())
+    {
+        return Err(DuckLakeError::InvalidConfig(
+            "flush an overlay before merging it".to_string(),
+        ));
+    }
+    let options = crate::table_writer::TableWriteOptions::new()
+        .with_expected_base_snapshot_id(table.overlay.snapshot());
+    let (snapshot_id, _) = table_writer
+        .transaction()
+        .with_options(&options)
+        .commit_overlay(&OverlayCommit {
+            overlay_table_id: table.overlay.table_id(),
+            create: None,
+            rebase: None,
+            merge: true,
+            hide: Vec::new(),
+            hide_inlined: Vec::new(),
+            fold: Vec::new(),
+        })
+        .await?;
+    Ok(snapshot_id)
+}

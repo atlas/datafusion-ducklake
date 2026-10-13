@@ -273,6 +273,7 @@ impl OverlayStatement {
                 overlay_table_id: self.overlay_table_id,
                 create: None,
                 rebase: None,
+                merge: false,
                 hide,
                 hide_inlined,
                 fold: Vec::new(),

@@ -3190,6 +3190,45 @@ impl DuckLakeWriteTransaction<'_> {
         Ok(())
     }
 
+    /// [`Self::stage_table`] for a new table whose columns take the ids
+    /// `column_id` gives their paths (names from the top-level column down),
+    /// such as another table's: a file written for one then reads as the
+    /// other's.
+    pub(crate) fn stage_table_with_column_ids(
+        &mut self,
+        schema_name: &str,
+        table_name: &str,
+        arrow_schema: &Schema,
+        column_id: impl Fn(&[String]) -> Option<i64>,
+    ) -> Result<i64> {
+        let table_id = self.stage_table(schema_name, table_name, arrow_schema)?;
+        let staged = &mut self
+            .writes
+            .last_mut()
+            .expect("stage_table staged one table")
+            .write;
+        let nodes = crate::metadata_writer::catalog_column_defs(&staged.columns)?;
+        let mut paths: Vec<Vec<String>> = Vec::with_capacity(nodes.len());
+        let mut ids = Vec::with_capacity(nodes.len());
+        for node in &nodes {
+            let mut path = node
+                .parent_index
+                .map(|parent| paths[parent].clone())
+                .unwrap_or_default();
+            path.push(node.name.clone());
+            let id = column_id(&path).ok_or_else(|| {
+                crate::DuckLakeError::InvalidConfig(format!(
+                    "no column id for column '{}'",
+                    path.join(".")
+                ))
+            })?;
+            ids.push(id);
+            paths.push(path);
+        }
+        staged.column_ids = ids;
+        Ok(table_id)
+    }
+
     /// Stages `table_name` with `arrow_schema`'s columns and no rows: the
     /// commit creates the table, or alters an existing one to those columns.
     /// Returns the table id the commit maps to the committed one.

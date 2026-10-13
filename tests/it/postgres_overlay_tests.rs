@@ -16,7 +16,9 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
 use datafusion_ducklake::metadata_writer::MetadataWriter;
-use datafusion_ducklake::overlay::{DuckLakeOverlayTable, OverlayBaseProvider, create_overlay};
+use datafusion_ducklake::overlay::{
+    DuckLakeOverlayTable, OverlayBase, OverlayBaseProvider, create_overlay, flush_overlay,
+};
 use datafusion_ducklake::overlay_postgres::{initialize_overlay_schema, load_overlay_base};
 use datafusion_ducklake::{
     DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter, LakePool, MetadataProvider,
@@ -216,12 +218,13 @@ impl Lake {
                 .fetch_one(&self.pool)
                 .await
                 .unwrap();
-        let base_provider = Arc::new(OverlayBaseProvider::new(self.provider(), Arc::new(base)));
+        let base = Arc::new(base);
+        let base_provider = Arc::new(OverlayBaseProvider::new(self.provider(), base.clone()));
         let underlay = self
             .table_at(base_provider, base_snapshot, &underlay_name)
             .await;
         let overlay = self.table_at(self.provider(), snapshot, name).await;
-        DuckLakeOverlayTable::try_new(underlay, overlay).unwrap()
+        DuckLakeOverlayTable::try_new(base, underlay, overlay).unwrap()
     }
 }
 
@@ -257,11 +260,12 @@ impl Lake {
                 .fetch_one(&self.pool)
                 .await
                 .unwrap();
-        let base_provider = Arc::new(OverlayBaseProvider::new(provider, Arc::new(base)));
+        let base = Arc::new(base);
+        let base_provider = Arc::new(OverlayBaseProvider::new(provider, base.clone()));
         let underlay = self
             .table_at(base_provider, base_snapshot, &underlay_name)
             .await;
-        DuckLakeOverlayTable::try_new(underlay, Arc::new(overlay)).unwrap()
+        DuckLakeOverlayTable::try_new(base, underlay, Arc::new(overlay)).unwrap()
     }
 
     /// Runs one DML statement on the overlay `name` as `ov`; returns its count.
@@ -294,6 +298,16 @@ impl Lake {
         .await
         .unwrap();
         (snapshot, table_id)
+    }
+
+    /// Flushes the overlay `o` as it is now.
+    async fn flush(&self) -> Option<i64> {
+        let table = self.writable_overlay("o").await;
+        let writer = self.writer().await;
+        let ctx = SessionContext::new();
+        flush_overlay(&table, &self.table_writer(writer), "main", &ctx.state())
+            .await
+            .unwrap()
     }
 
     async fn count(&self, sql: &str) -> i64 {
@@ -478,7 +492,24 @@ async fn an_overlay_refuses_columns_that_differ_from_its_underlays() {
         .unwrap();
     let underlay = lake.table_at(lake.provider(), head, "t").await;
     let overlay = lake.table_at(lake.provider(), lake.head().await, "o").await;
-    assert!(DuckLakeOverlayTable::try_new(underlay, overlay).is_err());
+    let base = |table_id, base_snapshot| {
+        Arc::new(OverlayBase {
+            underlay_table_id: table_id,
+            base_snapshot,
+            inlined_deletes: Vec::new(),
+            inlined_row_deletes: Default::default(),
+            delete_files: std::collections::HashMap::new(),
+        })
+    };
+    let t = lake.table_id("t").await;
+    assert!(
+        DuckLakeOverlayTable::try_new(base(t, head), underlay.clone(), overlay.clone()).is_err(),
+        "the columns differ"
+    );
+    assert!(
+        DuckLakeOverlayTable::try_new(base(t, head - 1), underlay, overlay).is_err(),
+        "the underlay is not read at the base"
+    );
 }
 
 /// An overlay's base is read on the catalog runtime, as every other use of a
@@ -726,4 +757,73 @@ async fn a_write_conflicts_with_a_change_to_the_overlay_table_alone() {
         "{error}"
     );
     assert_eq!(lake.head().await, before, "a conflict commits nothing");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_flush_folds_what_an_overlay_holds_inline_into_files() {
+    let lake = Lake::start().await;
+    lake.write("t", &[1, 2, 3, 4], &["a", "b", "c", "d"]).await;
+    // At the base the underlay itself has deleted record 4.
+    lake.sql("DELETE FROM lake.main.t WHERE id = 4").await;
+    let (_, overlay) = lake.create("o").await;
+    lake.change("o", "UPDATE ov SET name = 'B' WHERE id = 2")
+        .await
+        .unwrap();
+    lake.change("o", "INSERT INTO ov VALUES (5, 'e')")
+        .await
+        .unwrap();
+    let before = lake.head().await;
+    let expected_rows = expected(&[(1, "a"), (2, "B"), (3, "c"), (5, "e")]);
+
+    assert!(lake.flush().await.is_some());
+    let live_inline = format!(
+        "SELECT COUNT(*) FROM lake.ducklake_overlay_inlined_delete
+         WHERE overlay_table_id = {overlay} AND end_snapshot IS NULL"
+    );
+    let live_files = format!(
+        "SELECT COUNT(*) FROM lake.ducklake_overlay_delete_file
+         WHERE overlay_table_id = {overlay} AND end_snapshot IS NULL"
+    );
+    assert_eq!(lake.count(&live_inline).await, 0);
+    assert_eq!(lake.count(&live_files).await, 1);
+    assert_eq!(
+        rows(lake.overlay("o", lake.head().await).await).await,
+        expected_rows
+    );
+    assert_eq!(rows(lake.overlay("o", before).await).await, expected_rows);
+    assert!(lake.flush().await.is_none(), "nothing left to flush");
+
+    // A later hide in the same file is folded with the earlier ones, and the
+    // underlay's own delete at the base stays.
+    lake.change("o", "DELETE FROM ov WHERE id = 3")
+        .await
+        .unwrap();
+    lake.change("o", "DELETE FROM ov WHERE id = 2")
+        .await
+        .unwrap();
+    assert!(lake.flush().await.is_some());
+    assert_eq!(lake.count(&live_inline).await, 0);
+    assert_eq!(lake.count(&live_files).await, 1);
+    assert_eq!(
+        rows(lake.overlay("o", lake.head().await).await).await,
+        expected(&[(1, "a"), (5, "e")])
+    );
+    // Writes after a flush see what it folded.
+    assert_eq!(
+        lake.change("o", "DELETE FROM ov WHERE id IN (2, 3, 4)")
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        lake.change("o", "UPDATE ov SET name = 'A' WHERE id = 1")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        rows(lake.overlay("o", lake.head().await).await).await,
+        expected(&[(1, "A"), (5, "e")])
+    );
 }

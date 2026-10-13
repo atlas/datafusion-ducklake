@@ -292,6 +292,18 @@ pub(crate) async fn apply_overlay_at_snapshot(
         &commit.hide_inlined,
     )
     .await?;
+    for fold in &commit.fold {
+        apply_fold(
+            tx,
+            snapshot_id,
+            overlay_table_id,
+            underlay_table_id,
+            base_snapshot,
+            fold,
+        )
+        .await?;
+    }
+
     if commit.hide.is_empty() {
         return Ok(());
     }
@@ -394,6 +406,86 @@ async fn hide_inlined_rows(
     .bind(overlay_table_id)
     .bind(snapshot_id)
     .bind(row_ids)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Supersedes the overlay's delete file for one underlay data file and ends
+/// the inline positions it folds.
+#[cfg(feature = "write-postgres")]
+async fn apply_fold(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    snapshot_id: i64,
+    overlay_table_id: i64,
+    underlay_table_id: i64,
+    base_snapshot: i64,
+    fold: &crate::overlay::OverlayFold,
+) -> Result<()> {
+    use crate::DuckLakeError;
+
+    let in_base: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM ducklake_data_file
+             WHERE data_file_id = $1 AND table_id = $2 AND begin_snapshot <= $3
+               AND (end_snapshot IS NULL OR $3 < end_snapshot))",
+    )
+    .bind(fold.data_file_id)
+    .bind(underlay_table_id)
+    .bind(base_snapshot)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !in_base {
+        return Err(DuckLakeError::Conflict(format!(
+            "data file {} is not in overlay {overlay_table_id}'s underlay at the base",
+            fold.data_file_id
+        )));
+    }
+    let live: Option<i64> = sqlx::query_scalar(
+        "SELECT delete_file_id FROM ducklake_overlay_delete_file
+         WHERE overlay_table_id = $1 AND data_file_id = $2 AND end_snapshot IS NULL",
+    )
+    .bind(overlay_table_id)
+    .bind(fold.data_file_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if live != fold.expected_prev_delete_file {
+        return Err(DuckLakeError::Conflict(format!(
+            "overlay {overlay_table_id}'s delete file for data file {} changed from {:?} to {live:?}",
+            fold.data_file_id, fold.expected_prev_delete_file
+        )));
+    }
+    if let Some(previous) = live {
+        sqlx::query(
+            "UPDATE ducklake_overlay_delete_file SET end_snapshot = $1 WHERE delete_file_id = $2",
+        )
+        .bind(snapshot_id)
+        .bind(previous)
+        .execute(&mut **tx)
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO ducklake_overlay_delete_file
+             (overlay_table_id, data_file_id, path, path_is_relative, file_size_bytes,
+              footer_size, delete_count, begin_snapshot)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(overlay_table_id)
+    .bind(fold.data_file_id)
+    .bind(&fold.file.path)
+    .bind(fold.file.path_is_relative)
+    .bind(fold.file.file_size_bytes)
+    .bind(fold.file.footer_size)
+    .bind(fold.delete_count)
+    .bind(snapshot_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE ducklake_overlay_inlined_delete SET end_snapshot = $1
+         WHERE overlay_table_id = $2 AND data_file_id = $3 AND end_snapshot IS NULL",
+    )
+    .bind(snapshot_id)
+    .bind(overlay_table_id)
+    .bind(fold.data_file_id)
     .execute(&mut **tx)
     .await?;
     Ok(())

@@ -2185,7 +2185,7 @@ async fn stale_expected_base_snapshot_conflicts_and_commits_nothing() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn update_refuses_tables_with_inlined_rows() {
+async fn update_changes_file_and_inlined_rows_in_one_snapshot() {
     let t = TempDir::new().unwrap();
     let writer = Arc::new(make_writer(&t).await);
     let options = DuckLakeWriteOptions::default().with_data_inlining_row_limit(0);
@@ -2196,7 +2196,7 @@ async fn update_refuses_tables_with_inlined_rows() {
         .await
         .unwrap();
 
-    // Explicitly enable inlining to exercise the current-snapshot UPDATE guard
+    // Rows 1 and 2 are in a file; row 3 is inlined.
     let writer = SqliteMetadataWriter::new(&rw_url(&t)).await.unwrap();
     let provider = SqliteMetadataProvider::new(&rw_url(&t)).await.unwrap();
     let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer))
@@ -2210,21 +2210,24 @@ async fn update_refuses_tables_with_inlined_rows() {
         .collect()
         .await
         .unwrap();
-    let error = match ctx
-        .sql("UPDATE ducklake.main.t SET val = 99 WHERE id = 1")
-        .await
-    {
-        Ok(df) => df.collect().await.expect_err("UPDATE must refuse"),
-        Err(e) => e,
+    let pool = SqlitePool::connect(&rw_url(&t)).await.unwrap();
+    let snapshots = || async {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM ducklake_snapshot")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
     };
-    let message = error.to_string();
-    assert!(
-        message.contains("UPDATE on a table with inlined rows is not supported")
-            && message.contains("flush inlined data to Parquet"),
-        "{message}"
-    );
-    // Nothing changed.
-    assert_eq!(read_rows(&t, None).await, vec![(1, 10), (2, 20), (3, 30)]);
+    let before = snapshots().await;
+
+    ctx.sql("UPDATE ducklake.main.t SET val = val + 1 WHERE id IN (1, 3)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_eq!(snapshots().await, before + 1, "one UPDATE, one snapshot");
+    assert_eq!(read_rows(&t, None).await, vec![(1, 11), (2, 20), (3, 31)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

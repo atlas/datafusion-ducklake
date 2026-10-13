@@ -335,3 +335,70 @@ async fn duckdb_reads_our_inlined_rows() {
         .unwrap();
     assert_eq!(read, named(&[1, 2, 3, 4, 5, 6]));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn updates_stay_inlined_and_earlier_versions_stay_readable() {
+    let lake = Lake::start().await;
+    // Rows 1 to 4 in a file, 5 and 6 inlined.
+    lake.table_writer(3)
+        .await
+        .write_table("main", "t", &[batch(&[1, 2, 3, 4])])
+        .await
+        .unwrap();
+    lake.table_writer(3)
+        .await
+        .append_table("main", "t", &[batch(&[5, 6])])
+        .await
+        .unwrap();
+    let writer = lake.writer().await;
+    let table_id: i64 = sqlx::query_scalar("SELECT table_id FROM lake.ducklake_table")
+        .fetch_one(&lake.pool)
+        .await
+        .unwrap();
+    tokio::task::spawn_blocking(move || {
+        writer
+            .set_table_setting(table_id, "data_inlining_row_limit", "10")
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let before = lake.head().await;
+    let files = lake.data_files().await;
+
+    // One file row and one inlined row, edited the way an overlay edits.
+    for value in ["x", "y"] {
+        lake.session(None)
+            .await
+            .sql(&format!(
+                "UPDATE lake.main.t SET name = '{value}' WHERE id IN (2, 5)"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        lake.data_files().await,
+        files,
+        "small updates write no file"
+    );
+    assert_eq!(lake.head().await, before + 2, "one snapshot per UPDATE");
+    let expected = |name: &str| {
+        vec![
+            (1, "n1".to_string()),
+            (2, name.to_string()),
+            (3, "n3".to_string()),
+            (4, "n4".to_string()),
+            (5, name.to_string()),
+            (6, "n6".to_string()),
+        ]
+    };
+    assert_eq!(lake.rows(None).await, expected("y"));
+    assert_eq!(lake.rows(Some(before + 1)).await, expected("x"));
+    let mut at_start = named(&[1, 2, 3, 4, 5, 6]);
+    at_start.sort();
+    assert_eq!(lake.rows(Some(before)).await, at_start);
+}

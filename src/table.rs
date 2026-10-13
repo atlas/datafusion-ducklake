@@ -5475,21 +5475,6 @@ impl TableProvider for DuckLakeTable {
             ));
         }
 
-        // UPDATE rewrites Parquet-resident rows only; visible inlined rows would
-        // be silently skipped. Refuse loudly instead (same detection DELETE uses).
-        let inlined = self.provider.get_inlined_data(
-            self.table_id,
-            self.provider.get_current_snapshot()?,
-            &self.columns,
-        )?;
-        if inlined.iter().any(|batch| batch.num_rows() > 0) {
-            return Err(crate::DuckLakeError::Unsupported(format!(
-                "UPDATE on a table with inlined rows is not supported; \
-                 {INLINED_DATA_REMEDIATION}"
-            ))
-            .into());
-        }
-
         // Assignment / filter expressions reference the table's DATA columns
         // (unqualified), never the synthetic `rowid`. Plan them against the
         // physical schema so column indices line up with the scanned batches.

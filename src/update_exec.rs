@@ -23,6 +23,13 @@
 //!    `TableWriteSession::finish_with_deletes`.
 //! 4. Yield a single row `count: UInt64` = rows updated.
 //!
+//! A table with inlined rows takes another commit. Matched inlined rows are
+//! ended, and every new row version, from a file or from an inlined row, is
+//! written as a new row (inlined when the write is small enough) together with
+//! the positional deletes in one snapshot through a staged write. Those
+//! versions get new rowids, so the change feed reports them as a delete and an
+//! insert rather than an update pair.
+//!
 //! Limitations (shared with [`DuckLakeInsertExec`](crate::insert_exec)):
 //! collects matched rows into memory before writing; runs in a single DataFusion
 //! output partition.
@@ -51,9 +58,10 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use futures::stream::{self, TryStreamExt};
 
 use crate::compaction::sorted_rewrite_batches;
-use crate::metadata_writer::{DeleteFileEntry, MetadataWriter, WriteMode};
+use crate::metadata_writer::{DeleteFileEntry, InlinedRowRef, MetadataWriter, WriteMode};
 use crate::table::{DuckLakeTable, UpdateSourceScan};
-use crate::table_writer::{DuckLakeTableWriter, validate_not_null_batches};
+use crate::table_writer::{DuckLakeTableWriter, TableWriteOptions, validate_not_null_batches};
+use arrow::array::{Array, BooleanArray};
 
 /// Schema for the output of update operations (count of rows updated).
 fn make_update_count_schema() -> SchemaRef {
@@ -257,7 +265,34 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                 ));
             }
 
+            // Inlined rows: each matched one is ended, and its new version is
+            // written as a new row.
+            let mut inlined_rows: Vec<InlinedRowRef> = Vec::new();
+            let mut inlined_versions: Vec<RecordBatch> = Vec::new();
+            for inlined in table
+                .inlined_data_with_row_ids()
+                .map_err(|e| DataFusionError::External(Box::new(e)))?
+            {
+                let Some((matched, versions)) = update_inlined_batch(
+                    &physical_schema,
+                    &inlined.batch,
+                    predicate.as_ref(),
+                    &assignments,
+                )?
+                else {
+                    continue;
+                };
+                total_updated += matched.len() as u64;
+                inlined_rows.extend(matched.into_iter().map(|row| InlinedRowRef {
+                    table_name: inlined.table_name.clone(),
+                    row_id: inlined.row_ids[row],
+                }));
+                inlined_versions.push(versions);
+            }
+
             validate_not_null_batches(physical_schema.as_ref(), &updated_batches)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            validate_not_null_batches(physical_schema.as_ref(), &inlined_versions)
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
             let mut delete_entries: Vec<DeleteFileEntry> =
@@ -278,6 +313,42 @@ impl ExecutionPlan for DuckLakeUpdateExec {
             // No matching rows: genuine no-op, publish nothing.
             if total_updated == 0 {
                 let count: ArrayRef = Arc::new(UInt64Array::from(vec![0u64]));
+                return Ok(RecordBatch::try_new(output_schema, vec![count])?);
+            }
+
+            if !inlined_rows.is_empty() {
+                // New versions of file rows drop their rowid and join the
+                // inlined rows' versions, staged with every delete in one
+                // snapshot that conflicts with any change since the read.
+                let columns = physical_schema.fields().len();
+                let mut versions =
+                    Vec::with_capacity(updated_batches.len() + inlined_versions.len());
+                for batch in updated_batches.iter().chain(&inlined_versions) {
+                    versions.push(RecordBatch::try_new(
+                        Arc::clone(&physical_schema),
+                        batch.columns()[..columns].to_vec(),
+                    )?);
+                }
+                let mut options = TableWriteOptions::new();
+                options.expected_base_snapshot_id = Some(base_snapshot);
+                let mut transaction = table_writer.transaction().with_options(&options);
+                transaction
+                    .stage_write_with_deletes(
+                        &schema_name,
+                        &table_name,
+                        physical_schema.as_ref(),
+                        WriteMode::Append,
+                        &versions,
+                        &delete_entries,
+                        &inlined_rows,
+                    )
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let count: ArrayRef = Arc::new(UInt64Array::from(vec![total_updated]));
                 return Ok(RecordBatch::try_new(output_schema, vec![count])?);
             }
 
@@ -322,6 +393,66 @@ impl ExecutionPlan for DuckLakeUpdateExec {
             stream.map_err(|e: DataFusionError| e),
         )))
     }
+}
+
+/// The inlined rows of `batch` that `predicate` matches, by index, and their
+/// new versions with `assignments` applied, in a nullable copy of
+/// `physical_schema` (the caller validates NOT NULL), or `None` when none match.
+fn update_inlined_batch(
+    physical_schema: &SchemaRef,
+    batch: &RecordBatch,
+    predicate: Option<&Arc<dyn PhysicalExpr>>,
+    assignments: &[(usize, Arc<dyn PhysicalExpr>)],
+) -> DataFusionResult<Option<(Vec<usize>, RecordBatch)>> {
+    let rows = batch.num_rows();
+    let columns = physical_schema
+        .fields()
+        .iter()
+        .zip(batch.columns())
+        .map(|(field, column)| crate::column_rename::coerce_column(column, field.data_type()))
+        .collect::<DataFusionResult<Vec<_>>>()?;
+    let nullable = Arc::new(Schema::new(
+        physical_schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone().with_nullable(true))
+            .collect::<Vec<_>>(),
+    ));
+    let batch = RecordBatch::try_new(Arc::clone(&nullable), columns)?;
+    // A NULL predicate result is a non-match, as for file rows.
+    let mask = match predicate {
+        Some(predicate) => {
+            let values = predicate.evaluate(&batch)?.into_array(rows)?;
+            let values = values
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "UPDATE predicate did not evaluate to a boolean".to_string(),
+                    )
+                })?;
+            BooleanArray::from(
+                (0..rows)
+                    .map(|row| values.is_valid(row) && values.value(row))
+                    .collect::<Vec<_>>(),
+            )
+        },
+        None => BooleanArray::from(vec![true; rows]),
+    };
+    if mask.true_count() == 0 {
+        return Ok(None);
+    }
+    let matched = (0..rows).filter(|row| mask.value(*row)).collect::<Vec<_>>();
+    let selected = arrow::compute::filter_record_batch(&batch, &mask)?;
+    let mut columns = selected.columns().to_vec();
+    for (column, expr) in assignments {
+        let value = expr.evaluate(&selected)?.into_array(selected.num_rows())?;
+        columns[*column] = crate::column_rename::coerce_column(
+            &value,
+            physical_schema.field(*column).data_type(),
+        )?;
+    }
+    Ok(Some((matched, RecordBatch::try_new(nullable, columns)?)))
 }
 
 #[cfg(test)]

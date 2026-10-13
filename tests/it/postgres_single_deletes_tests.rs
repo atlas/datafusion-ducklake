@@ -527,6 +527,38 @@ async fn a_login_that_may_only_change_rows_commits_to_a_lake() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_lakes_data_path_is_none_until_it_is_created() {
+    let (pool, _container) = database().await.unwrap();
+    let lake = PostgresSingleCatalogMetadataWriter::from_lake(LakePool::in_schema(
+        pool.clone(),
+        "not_yet",
+    ));
+    assert_eq!(lake.data_path().await.unwrap(), None);
+    let lake = tokio::task::spawn_blocking(move || {
+        lake.initialize_schema().unwrap();
+        lake
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        lake.data_path().await.unwrap(),
+        None,
+        "created, but given no path"
+    );
+    let lake = tokio::task::spawn_blocking(move || {
+        lake.set_data_path("s3://bucket/lake/").unwrap();
+        lake
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        lake.data_path().await.unwrap().as_deref(),
+        Some("s3://bucket/lake/")
+    );
+}
+
 #[cfg(feature = "metadata-duckdb")]
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]

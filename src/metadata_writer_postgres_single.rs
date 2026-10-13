@@ -461,6 +461,30 @@ impl PostgresSingleCatalogMetadataWriter {
         }
     }
 
+    /// Where the lake keeps its data, or `None` when its catalog does not exist yet or
+    /// records no data path. Any other failure to read it is an error, never `None`, so
+    /// a caller may treat `None` as "a lake to create" without moving one that exists.
+    ///
+    /// Read on the catalog runtime, like every other use of the pool.
+    pub async fn data_path(&self) -> Result<Option<String>> {
+        let pool = self.pool.clone();
+        crate::metadata_provider::connect_on_catalog_runtime(async move {
+            let catalog: Option<String> =
+                sqlx::query_scalar("SELECT to_regclass('ducklake_metadata')::text")
+                    .fetch_one(&pool)
+                    .await?;
+            if catalog.is_none() {
+                return Ok(None);
+            }
+            Ok(sqlx::query_scalar(
+                "SELECT value FROM ducklake_metadata WHERE key = 'data_path' AND scope IS NULL",
+            )
+            .fetch_optional(&pool)
+            .await?)
+        })
+        .await
+    }
+
     /// Open a writer and create/upgrade the DuckLake catalog tables.
     pub async fn new_with_init(connection_string: &str) -> Result<Self> {
         let writer = Self::new(connection_string).await?;

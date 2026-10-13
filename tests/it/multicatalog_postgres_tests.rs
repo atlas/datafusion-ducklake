@@ -6607,6 +6607,7 @@ async fn register_existing_data_files_persists_column_stats_and_the_rollup() {
         value_count: Some(value_count),
         contains_nan,
         column_size_bytes: Some(size),
+        extra_stats: None,
     };
     let f1_stats = vec![
         stat(100, Some("1"), Some("3"), 0, 3, None, 111),
@@ -6726,6 +6727,7 @@ async fn register_existing_data_files_refuses_stats_for_columns_it_does_not_adop
         value_count: Some(3),
         contains_nan: None,
         column_size_bytes: Some(10),
+        extra_stats: None,
     };
     let attempts = [
         (
@@ -6806,6 +6808,7 @@ async fn file_column_stats(pool: &PgPool, table_id: i64) -> Vec<(String, ColumnS
                 value_count: r.get(5),
                 contains_nan: r.get(6),
                 column_size_bytes: r.get(7),
+                extra_stats: None,
             },
         )
     })
@@ -7014,6 +7017,7 @@ async fn postgres_file_and_table_column_stats_round_trip_per_column() {
             value_count: Some(300),
             contains_nan: None,
             column_size_bytes: Some(1_111),
+            extra_stats: None,
         },
         ColumnStat {
             column_id: begin.column_ids[1],
@@ -7023,6 +7027,7 @@ async fn postgres_file_and_table_column_stats_round_trip_per_column() {
             value_count: Some(293),
             contains_nan: None,
             column_size_bytes: Some(2_222),
+            extra_stats: None,
         },
         // All-NULL column: bounds absent, size still present.
         ColumnStat {
@@ -7033,6 +7038,7 @@ async fn postgres_file_and_table_column_stats_round_trip_per_column() {
             value_count: Some(0),
             contains_nan: None,
             column_size_bytes: Some(3_333),
+            extra_stats: None,
         },
     ];
 
@@ -7284,6 +7290,7 @@ fn file_stats(column_ids: &[i64]) -> Vec<datafusion_ducklake::metadata_writer::C
                 value_count: Some(5),
                 contains_nan: None,
                 column_size_bytes: Some(64),
+                extra_stats: None,
             },
         )
         .collect()

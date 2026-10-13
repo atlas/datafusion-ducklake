@@ -75,6 +75,7 @@ pub mod delete_filter;
 pub mod encryption;
 pub mod error;
 pub(crate) mod field_id_adapter;
+pub mod geometry;
 pub mod information_schema;
 pub mod inlined_filter;
 pub(crate) mod lazy_delete_filter;
@@ -82,6 +83,7 @@ pub mod metadata_provider;
 pub(crate) mod nan_pruning_barrier;
 mod nested_inline;
 pub(crate) mod open_time_filter_barrier;
+pub mod overlay;
 pub mod partition;
 pub mod path_resolver;
 pub mod row_id;
@@ -99,6 +101,8 @@ pub mod types;
 pub(crate) mod view;
 
 // Metadata providers (feature-gated)
+#[cfg(feature = "metadata-postgres")]
+pub mod metadata_pool_postgres;
 #[cfg(feature = "metadata-duckdb")]
 pub mod metadata_provider_duckdb;
 #[cfg(feature = "metadata-mysql")]
@@ -107,6 +111,8 @@ pub mod metadata_provider_mysql;
 pub mod metadata_provider_postgres;
 #[cfg(feature = "metadata-sqlite")]
 pub mod metadata_provider_sqlite;
+#[cfg(feature = "metadata-postgres")]
+pub mod overlay_postgres;
 
 // Write support (feature-gated)
 #[cfg(feature = "write")]
@@ -161,9 +167,13 @@ pub use schema::DuckLakeSchema;
 pub use snapshot_consistency::register_snapshot_consistency;
 pub use sort::{NullOrder, SortDirection, SortField, SortSpec};
 pub use table::DuckLakeTable;
+#[cfg(feature = "write")]
+pub use table::MatchedRows;
 pub use table_functions::register_ducklake_functions;
 
 // Re-export metadata providers (feature-gated)
+#[cfg(feature = "metadata-postgres")]
+pub use metadata_pool_postgres::{LakePool, TableLock};
 #[cfg(feature = "metadata-duckdb")]
 pub use metadata_provider_duckdb::DuckdbMetadataProvider;
 #[cfg(feature = "metadata-mysql")]

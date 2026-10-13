@@ -11,6 +11,7 @@
 
 use crate::Result;
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
+use crate::metadata_pool_postgres::Begin;
 use crate::metadata_provider::{TagObjectType, TagTarget, block_on};
 use crate::metadata_writer::is_inlined_system_column;
 use crate::metadata_writer::{
@@ -893,8 +894,8 @@ async fn record_file_reference(
 /// DuckLake readers expect. Idempotent. Used by the single-catalog writer; the
 /// multicatalog layout keeps its paths as given because its cleanup APIs match
 /// `data_path` strings exactly and DuckDB never reads that layout.
-pub(crate) async fn migrate_directory_paths(pool: &PgPool) -> Result<()> {
-    let mut tx = pool.begin().await?;
+pub(crate) async fn migrate_directory_paths(pool: &impl Begin) -> Result<()> {
+    let mut tx = pool.begin_catalog().await?;
     sqlx::query(
         "UPDATE ducklake_metadata SET value = value || '/'
          WHERE key = 'data_path' AND scope IS NULL AND value <> '' AND value NOT LIKE '%/'",
@@ -1507,7 +1508,7 @@ pub(crate) async fn detect_inlined_delete_since(
 
 // The SHARE lock orders inserts from other PostgreSQL clients with the
 // source-file check and surrounding metadata commit.
-async fn detect_new_inlined_deletes(
+pub(crate) async fn detect_new_inlined_deletes(
     table_id: i64,
     base_snapshot: i64,
     data_file_ids: &[i64],
@@ -1710,7 +1711,7 @@ async fn schedule_compaction_files(
 /// every commit, and against a networked Postgres the round trip dominates the
 /// work — a wide table otherwise pays one round trip per column. Passing the
 /// columns as arrays (rather than a generated `VALUES` list) keeps the bind
-/// count fixed at nine, so a table cannot approach Postgres's 65535-parameter
+/// count fixed at ten, so a table cannot approach Postgres's 65535-parameter
 /// ceiling however many columns it has.
 async fn insert_file_column_stats(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -1729,17 +1730,18 @@ async fn insert_file_column_stats(
     let mins: Vec<Option<String>> = column_stats.iter().map(|s| s.min_value.clone()).collect();
     let maxes: Vec<Option<String>> = column_stats.iter().map(|s| s.max_value.clone()).collect();
     let nans: Vec<Option<bool>> = column_stats.iter().map(|s| s.contains_nan).collect();
+    let extras: Vec<Option<String>> = column_stats.iter().map(|s| s.extra_stats.clone()).collect();
 
     sqlx::query(
         "INSERT INTO ducklake_file_column_stats
              (data_file_id, table_id, column_id, column_size_bytes,
               value_count, null_count, min_value, max_value, contains_nan, extra_stats)
          SELECT $1, $2, u.column_id, u.column_size_bytes,
-                u.value_count, u.null_count, u.min_value, u.max_value, u.contains_nan, NULL
+                u.value_count, u.null_count, u.min_value, u.max_value, u.contains_nan, u.extra_stats
          FROM UNNEST($3::bigint[], $4::bigint[], $5::bigint[], $6::bigint[],
-                     $7::text[], $8::text[], $9::boolean[])
+                     $7::text[], $8::text[], $9::boolean[], $10::text[])
               AS u(column_id, column_size_bytes, value_count, null_count,
-                   min_value, max_value, contains_nan)",
+                   min_value, max_value, contains_nan, extra_stats)",
     )
     .bind(data_file_id)
     .bind(table_id)
@@ -1750,6 +1752,7 @@ async fn insert_file_column_stats(
     .bind(&mins)
     .bind(&maxes)
     .bind(&nans)
+    .bind(&extras)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -2049,7 +2052,7 @@ async fn recompute_table_column_stats(
 
     let mut per_file: Vec<FileColumnStat> = Vec::new();
     for row in sqlx::query(
-        "SELECT s.column_id, s.min_value, s.max_value, s.null_count, s.contains_nan
+        "SELECT s.column_id, s.min_value, s.max_value, s.null_count, s.contains_nan, s.extra_stats
          FROM ducklake_file_column_stats s
          JOIN ducklake_data_file d ON d.data_file_id = s.data_file_id
          WHERE d.table_id = $1 AND d.end_snapshot IS NULL",
@@ -2064,6 +2067,7 @@ async fn recompute_table_column_stats(
             max_value: row.try_get(2)?,
             null_count: row.try_get(3)?,
             contains_nan: row.try_get(4)?,
+            extra_stats: row.try_get(5)?,
         });
     }
 
@@ -2092,13 +2096,14 @@ async fn recompute_table_column_stats(
     let contains_nan: Vec<Option<bool>> = globals.iter().map(|g| g.contains_nan).collect();
     let mins: Vec<Option<String>> = globals.iter().map(|g| g.min_value.clone()).collect();
     let maxes: Vec<Option<String>> = globals.iter().map(|g| g.max_value.clone()).collect();
+    let extras: Vec<Option<String>> = globals.iter().map(|g| g.extra_stats.clone()).collect();
 
     sqlx::query(
         "INSERT INTO ducklake_table_column_stats
              (table_id, column_id, contains_null, contains_nan, min_value, max_value, extra_stats)
-         SELECT $1, u.column_id, u.contains_null, u.contains_nan, u.min_value, u.max_value, NULL
-         FROM UNNEST($2::bigint[], $3::boolean[], $4::boolean[], $5::text[], $6::text[])
-              AS u(column_id, contains_null, contains_nan, min_value, max_value)",
+         SELECT $1, u.column_id, u.contains_null, u.contains_nan, u.min_value, u.max_value, u.extra_stats
+         FROM UNNEST($2::bigint[], $3::boolean[], $4::boolean[], $5::text[], $6::text[], $7::text[])
+              AS u(column_id, contains_null, contains_nan, min_value, max_value, extra_stats)",
     )
     .bind(table_id)
     .bind(&column_ids)
@@ -2106,6 +2111,7 @@ async fn recompute_table_column_stats(
     .bind(&contains_nan)
     .bind(&mins)
     .bind(&maxes)
+    .bind(&extras)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -2972,7 +2978,7 @@ pub(crate) async fn apply_inlined_deletes_at_snapshot(
 }
 
 pub(crate) fn set_postgres_table_setting(
-    pool: &PgPool,
+    pool: &impl Begin,
     guard: Option<&dyn PostgresCommitGuard>,
     catalog_id: Option<i64>,
     table_id: i64,
@@ -2981,7 +2987,7 @@ pub(crate) fn set_postgres_table_setting(
 ) -> Result<()> {
     let key = validate_table_setting(key)?;
     block_on(async {
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_catalog().await?;
         if let Some(catalog_id) = catalog_id {
             assert_table_in_catalog(catalog_id, table_id, &mut tx).await?;
         }
@@ -3003,12 +3009,12 @@ pub(crate) fn set_postgres_table_setting(
 }
 
 pub(crate) fn with_postgres_commit_lock(
-    pool: &PgPool,
+    pool: &impl Begin,
     identity: &str,
     operation: Box<dyn FnOnce() -> Result<()> + '_>,
 ) -> Result<()> {
     block_on(async {
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_catalog().await?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(identity)
             .execute(&mut *tx)

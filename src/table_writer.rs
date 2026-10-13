@@ -11,9 +11,9 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{FutureExt, StreamExt};
-use object_store::ObjectStore;
 use object_store::buffered::BufWriter as ObjectBufWriter;
 use object_store::path::Path as ObjectPath;
+use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
 use parquet::file::properties::{WriterProperties, WriterVersion};
@@ -2410,8 +2410,19 @@ impl DuckLakeWriteTransaction<'_> {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        self.stage_write(schema_name, table_name, arrow_schema, mode, batches)
-            .await?;
+        if let Err(e) = self
+            .stage_write(schema_name, table_name, arrow_schema, mode, batches)
+            .await
+        {
+            // The delete files were handed over with this call, and will never
+            // be committed now, so nothing else would remove them.
+            for path in &delete_paths {
+                if let Err(cleanup) = self.writer.object_store.delete(path).await {
+                    tracing::warn!(%path, error = %cleanup, "a staged delete file was not removed");
+                }
+            }
+            return Err(e);
+        }
         let prepared = self
             .writes
             .last_mut()
@@ -4065,7 +4076,7 @@ fn arrow_schema_to_column_defs(schema: &Schema) -> Result<Vec<ColumnDef>> {
     schema
         .fields()
         .iter()
-        .map(|field| ColumnDef::from_arrow(field.name(), field.data_type(), field.is_nullable()))
+        .map(|field| ColumnDef::from_arrow_field(field))
         .collect()
 }
 
@@ -4146,6 +4157,11 @@ fn build_schema_with_field_ids(schema: &Schema, column_ids: &[i64]) -> Result<Sc
             data_type => data_type.clone(),
         };
         let mut metadata: HashMap<String, String> = field.metadata().clone();
+        if crate::geometry::is_geometry_field(field)? {
+            // Without a CRS, as DuckDB writes geometry: the lake keeps none, and a
+            // file that named one would read back as a different Arrow field.
+            metadata.extend(crate::geometry::geometry_field("", true).metadata().clone());
+        }
         metadata.insert("PARQUET:field_id".to_string(), field_id.to_string());
         Ok(Field::new(field.name(), data_type, field.is_nullable()).with_metadata(metadata))
     }

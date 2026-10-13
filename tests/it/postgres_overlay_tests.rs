@@ -1,0 +1,403 @@
+#![cfg(feature = "write-postgres")]
+//! Overlays read from a lake in a Postgres schema of its own: the underlay as
+//! it was at the base, less what the overlay hides, plus the overlay's rows.
+
+use std::sync::Arc;
+
+use arrow::array::{Int64Array, RecordBatch, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
+use datafusion::catalog::{CatalogProvider, TableProvider};
+use datafusion::prelude::*;
+use object_store::local::LocalFileSystem;
+use sqlx::postgres::PgPool;
+use tempfile::TempDir;
+use testcontainers::ContainerAsync;
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::postgres::Postgres;
+
+use datafusion_ducklake::metadata_writer::MetadataWriter;
+use datafusion_ducklake::overlay::{DuckLakeOverlayTable, OverlayBaseProvider};
+use datafusion_ducklake::overlay_postgres::{initialize_overlay_schema, load_overlay_base};
+use datafusion_ducklake::{
+    DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter, LakePool, MetadataProvider,
+    PostgresMetadataProvider, PostgresSingleCatalogMetadataWriter, register_ducklake_functions,
+};
+
+const LAKE: &str = "lake";
+
+struct Lake {
+    pool: PgPool,
+    data: TempDir,
+    _container: ContainerAsync<Postgres>,
+}
+
+impl Lake {
+    async fn start() -> Self {
+        let container = Postgres::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let pool = LakePool::connect(
+            &format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres"),
+            4,
+        )
+        .await
+        .unwrap();
+        let lake = Self {
+            pool,
+            data: TempDir::new().unwrap(),
+            _container: container,
+        };
+        let writer = lake.writer().await;
+        drop(writer);
+        initialize_overlay_schema(&lake.lake_pool()).await.unwrap();
+        lake
+    }
+
+    fn lake_pool(&self) -> LakePool {
+        LakePool::in_schema(self.pool.clone(), LAKE)
+    }
+
+    async fn writer(&self) -> Arc<PostgresSingleCatalogMetadataWriter> {
+        let writer = PostgresSingleCatalogMetadataWriter::from_lake(self.lake_pool());
+        let path = format!("{}/", self.data.path().display());
+        let writer = tokio::task::spawn_blocking(move || {
+            writer.initialize_schema().unwrap();
+            writer.set_data_path(&path).unwrap();
+            writer
+        })
+        .await
+        .unwrap();
+        Arc::new(writer)
+    }
+
+    fn table_writer(
+        &self,
+        writer: Arc<PostgresSingleCatalogMetadataWriter>,
+    ) -> DuckLakeTableWriter {
+        DuckLakeTableWriter::new(writer, Arc::new(LocalFileSystem::new())).unwrap()
+    }
+
+    /// Writes `main.<table> (id, name)` as one data file.
+    async fn write(&self, table: &str, ids: &[i64], names: &[&str]) {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(ids.to_vec())),
+                Arc::new(StringArray::from(names.to_vec())),
+            ],
+        )
+        .unwrap();
+        self.table_writer(self.writer().await)
+            .write_table("main", table, &[batch])
+            .await
+            .unwrap();
+    }
+
+    fn provider(&self) -> Arc<dyn MetadataProvider> {
+        Arc::new(PostgresMetadataProvider::from_lake(self.lake_pool()))
+    }
+
+    async fn sql(&self, sql: &str) {
+        let catalog = DuckLakeCatalog::with_writer(self.provider(), self.writer().await).unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_catalog("lake", Arc::new(catalog));
+        register_ducklake_functions(&ctx, self.provider());
+        ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    }
+
+    async fn head(&self) -> i64 {
+        sqlx::query_scalar("SELECT MAX(snapshot_id) FROM lake.ducklake_snapshot")
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn table_id(&self, name: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT table_id FROM lake.ducklake_table WHERE table_name = $1 AND end_snapshot IS NULL",
+        )
+        .bind(name)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
+    }
+
+    /// The table's one data file live at `snapshot`: its id and path.
+    async fn data_file(&self, table_id: i64, snapshot: i64) -> (i64, String) {
+        sqlx::query_as(
+            "SELECT data_file_id, path FROM lake.ducklake_data_file
+             WHERE table_id = $1 AND begin_snapshot <= $2
+               AND (end_snapshot IS NULL OR $2 < end_snapshot)",
+        )
+        .bind(table_id)
+        .bind(snapshot)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
+    }
+
+    /// Records `overlay` as an overlay of `underlay` at `base`, from `begin`.
+    async fn make_overlay(&self, overlay: i64, underlay: i64, base: i64, begin: i64) {
+        sqlx::query(
+            "INSERT INTO lake.ducklake_overlay
+                 (overlay_table_id, underlay_table_id, base_snapshot, begin_snapshot)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(overlay)
+        .bind(underlay)
+        .bind(base)
+        .bind(begin)
+        .execute(&self.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn hide(
+        &self,
+        overlay: i64,
+        data_file: i64,
+        position: i64,
+        begin: i64,
+        end: Option<i64>,
+    ) {
+        sqlx::query(
+            "INSERT INTO lake.ducklake_overlay_inlined_delete
+                 (overlay_table_id, data_file_id, row_id, begin_snapshot, end_snapshot)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(overlay)
+        .bind(data_file)
+        .bind(position)
+        .bind(begin)
+        .bind(end)
+        .execute(&self.pool)
+        .await
+        .unwrap();
+    }
+
+    /// A table as a plain catalog at `snapshot` sees it.
+    async fn table_at(
+        &self,
+        provider: Arc<dyn MetadataProvider>,
+        snapshot: i64,
+        name: &str,
+    ) -> Arc<DuckLakeTable> {
+        let catalog = tokio::task::spawn_blocking(move || {
+            DuckLakeCatalog::with_snapshot(provider, snapshot).unwrap()
+        })
+        .await
+        .unwrap();
+        let table: Arc<dyn TableProvider> = catalog
+            .schema("main")
+            .unwrap()
+            .table(name)
+            .await
+            .unwrap()
+            .unwrap();
+        let table = (table.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<DuckLakeTable>()
+            .unwrap();
+        Arc::new(table.clone())
+    }
+
+    /// The overlay table `name` read at `snapshot`.
+    async fn overlay(&self, name: &str, snapshot: i64) -> DuckLakeOverlayTable {
+        let id = self.table_id(name).await;
+        let base = load_overlay_base(&self.lake_pool(), id, snapshot)
+            .await
+            .unwrap()
+            .expect("an overlay");
+        let base_snapshot = base.base_snapshot;
+        let underlay_name: String =
+            sqlx::query_scalar("SELECT table_name FROM lake.ducklake_table WHERE table_id = $1")
+                .bind(base.underlay_table_id)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap();
+        let base_provider = Arc::new(OverlayBaseProvider::new(self.provider(), Arc::new(base)));
+        let underlay = self
+            .table_at(base_provider, base_snapshot, &underlay_name)
+            .await;
+        let overlay = self.table_at(self.provider(), snapshot, name).await;
+        DuckLakeOverlayTable::try_new(underlay, overlay).unwrap()
+    }
+}
+
+async fn rows(table: impl TableProvider + 'static) -> Vec<(i64, String)> {
+    let ctx = SessionContext::new();
+    ctx.register_table("t", Arc::new(table)).unwrap();
+    let batches = ctx
+        .sql("SELECT id, name FROM t ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    batches
+        .iter()
+        .flat_map(|batch| {
+            let id = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .clone();
+            let name = arrow::compute::cast(batch.column(1), &DataType::Utf8).unwrap();
+            let name = name.as_any().downcast_ref::<StringArray>().unwrap().clone();
+            (0..batch.num_rows())
+                .map(move |i| (id.value(i), name.value(i).to_string()))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn expected(rows: &[(i64, &str)]) -> Vec<(i64, String)> {
+    rows.iter()
+        .map(|(id, name)| (*id, name.to_string()))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn an_overlay_reads_its_base_less_what_it_hides_plus_its_own_rows() {
+    let lake = Lake::start().await;
+    lake.write("t", &[1, 2, 3, 4], &["a", "b", "c", "d"]).await;
+    let underlay = lake.table_id("t").await;
+    let base = lake.head().await;
+    let (file, _) = lake.data_file(underlay, base).await;
+
+    // The overlay changes record 2 and adds record 5.
+    lake.write("o", &[2, 5], &["b2", "e"]).await;
+    let overlay = lake.table_id("o").await;
+    let created = lake.head().await;
+    lake.make_overlay(overlay, underlay, base, created).await;
+    lake.hide(overlay, file, 1, created, None).await;
+
+    // The underlay moves on after the base: the overlay does not see it.
+    lake.sql("DELETE FROM lake.main.t WHERE id = 3").await;
+    lake.sql("INSERT INTO lake.main.t VALUES (6, 'f')").await;
+
+    assert_eq!(
+        rows(lake.overlay("o", lake.head().await).await).await,
+        expected(&[(1, "a"), (2, "b2"), (3, "c"), (4, "d"), (5, "e")])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn an_overlay_delete_file_takes_the_place_of_the_underlays() {
+    let lake = Lake::start().await;
+    lake.write("t", &[1, 2, 3, 4], &["a", "b", "c", "d"]).await;
+    let underlay = lake.table_id("t").await;
+    // At the base the underlay has its own delete file, hiding record 4.
+    lake.sql("DELETE FROM lake.main.t WHERE id = 4").await;
+    let base = lake.head().await;
+    let (file, path) = lake.data_file(underlay, base).await;
+
+    lake.write("o", &[9], &["i"]).await;
+    let overlay = lake.table_id("o").await;
+    let created = lake.head().await;
+    lake.make_overlay(overlay, underlay, base, created).await;
+
+    // The overlay hides record 1. Its delete file holds the underlay's
+    // deletes at the base as well, so record 4 stays hidden.
+    let written = lake
+        .table_writer(lake.writer().await)
+        .write_delete_file("main", "t", &path, &[0, 3])
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO lake.ducklake_overlay_delete_file
+             (overlay_table_id, data_file_id, path, path_is_relative, file_size_bytes,
+              footer_size, delete_count, begin_snapshot)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(overlay)
+    .bind(file)
+    .bind(&written.path)
+    .bind(written.path_is_relative)
+    .bind(written.file_size_bytes)
+    .bind(written.footer_size)
+    .bind(written.delete_count)
+    .bind(created)
+    .execute(&lake.pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        rows(lake.overlay("o", created).await).await,
+        expected(&[(2, "b"), (3, "c"), (9, "i")])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn an_overlay_reads_as_of_its_own_earlier_snapshots() {
+    let lake = Lake::start().await;
+    lake.write("t", &[1, 2], &["a", "b"]).await;
+    let underlay = lake.table_id("t").await;
+    let base = lake.head().await;
+    let (file, _) = lake.data_file(underlay, base).await;
+
+    lake.write("o", &[3], &["c"]).await;
+    let overlay = lake.table_id("o").await;
+    let first = lake.head().await;
+    lake.make_overlay(overlay, underlay, base, first).await;
+
+    // A later overlay snapshot hides record 1; one after that restores it.
+    lake.sql("INSERT INTO lake.main.o VALUES (4, 'd')").await;
+    let second = lake.head().await;
+    lake.sql("INSERT INTO lake.main.o VALUES (5, 'e')").await;
+    let third = lake.head().await;
+    lake.hide(overlay, file, 0, second, Some(third)).await;
+
+    assert_eq!(
+        rows(lake.overlay("o", first).await).await,
+        expected(&[(1, "a"), (2, "b"), (3, "c")])
+    );
+    assert_eq!(
+        rows(lake.overlay("o", second).await).await,
+        expected(&[(2, "b"), (3, "c"), (4, "d")])
+    );
+    assert_eq!(
+        rows(lake.overlay("o", third).await).await,
+        expected(&[(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e")])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_table_that_is_not_an_overlay_has_no_base() {
+    let lake = Lake::start().await;
+    lake.write("t", &[1], &["a"]).await;
+    let table = lake.table_id("t").await;
+    let head = lake.head().await;
+    assert!(
+        load_overlay_base(&lake.lake_pool(), table, head)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn an_overlay_refuses_columns_that_differ_from_its_underlays() {
+    let lake = Lake::start().await;
+    lake.write("t", &[1], &["a"]).await;
+    let head = lake.head().await;
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+        vec![Arc::new(Int64Array::from(vec![2]))],
+    )
+    .unwrap();
+    lake.table_writer(lake.writer().await)
+        .write_table("main", "o", &[batch])
+        .await
+        .unwrap();
+    let underlay = lake.table_at(lake.provider(), head, "t").await;
+    let overlay = lake.table_at(lake.provider(), lake.head().await, "o").await;
+    assert!(DuckLakeOverlayTable::try_new(underlay, overlay).is_err());
+}

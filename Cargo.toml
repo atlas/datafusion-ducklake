@@ -31,7 +31,7 @@ datafusion-datasource = { version = "55", default-features = false }
 # stay in lockstep with `datafusion` above.
 datafusion-datasource-parquet = { version = "55", default-features = false }
 arrow = "59.2"
-parquet = { version = "59.2", features = ["async"] }
+parquet = { version = "59.2", features = ["async", "geospatial"] }
 object_store = { version = "0.13", default-features = false }
 url = "2.5"
 percent-encoding = "2"
@@ -40,6 +40,9 @@ tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 tracing = "0.1"
 thiserror = "2.0"
+# Geometry column `extra_stats` JSON; both already come in with parquet's `geospatial`.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # Encryption support (optional)
 base64 = { version = "0.22", optional = true }

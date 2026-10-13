@@ -1275,7 +1275,7 @@ async fn insert_file_column_stats(
             "INSERT INTO ducklake_file_column_stats
                  (data_file_id, table_id, column_id, column_size_bytes,
                   value_count, null_count, min_value, max_value, contains_nan, extra_stats)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(data_file_id)
         .bind(table_id)
@@ -1286,6 +1286,7 @@ async fn insert_file_column_stats(
         .bind(stat.min_value.as_deref())
         .bind(stat.max_value.as_deref())
         .bind(stat.contains_nan)
+        .bind(stat.extra_stats.as_deref())
         .execute(&mut **tx)
         .await?;
     }
@@ -1545,7 +1546,7 @@ async fn recompute_table_column_stats(
 
     let mut per_file: Vec<FileColumnStat> = Vec::new();
     for row in sqlx::query(
-        "SELECT s.column_id, s.min_value, s.max_value, s.null_count, s.contains_nan
+        "SELECT s.column_id, s.min_value, s.max_value, s.null_count, s.contains_nan, s.extra_stats
          FROM ducklake_file_column_stats s
          JOIN ducklake_data_file d ON d.data_file_id = s.data_file_id
          WHERE d.table_id = ? AND d.end_snapshot IS NULL",
@@ -1560,6 +1561,7 @@ async fn recompute_table_column_stats(
             max_value: row.try_get(2)?,
             null_count: row.try_get(3)?,
             contains_nan: row.try_get(4)?,
+            extra_stats: row.try_get(5)?,
         });
     }
 
@@ -1581,7 +1583,7 @@ async fn recompute_table_column_stats(
         sqlx::query(
             "INSERT INTO ducklake_table_column_stats
                  (table_id, column_id, contains_null, contains_nan, min_value, max_value, extra_stats)
-             VALUES (?, ?, ?, ?, ?, ?, NULL)",
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(table_id)
         .bind(g.column_id)
@@ -1589,6 +1591,7 @@ async fn recompute_table_column_stats(
         .bind(g.contains_nan)
         .bind(g.min_value)
         .bind(g.max_value)
+        .bind(g.extra_stats)
         .execute(&mut **tx)
         .await?;
     }

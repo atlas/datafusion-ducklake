@@ -177,13 +177,15 @@ pub use schema::DuckLakeSchema;
 pub use snapshot_consistency::register_snapshot_consistency;
 pub use sort::{NullOrder, SortDirection, SortField, SortSpec};
 pub use table::DuckLakeTable;
+#[cfg(feature = "write")]
+pub use table::MatchedRows;
 pub use table_functions::register_ducklake_functions;
 #[cfg(feature = "write")]
 pub use table_functions::register_ducklake_maintenance_functions;
 
 // Re-export metadata providers (feature-gated)
 #[cfg(feature = "metadata-postgres")]
-pub use metadata_pool_postgres::LakePool;
+pub use metadata_pool_postgres::{LakePool, TableLock};
 #[cfg(feature = "metadata-duckdb")]
 pub use metadata_provider_duckdb::DuckdbMetadataProvider;
 #[cfg(feature = "metadata-mysql")]

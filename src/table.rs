@@ -2781,6 +2781,100 @@ impl DuckLakeTable {
         ))
     }
 
+    /// The live rows matching `predicate`, file by file, each with its physical
+    /// position and what a delete file superseding the file's own needs.
+    ///
+    /// This is the read half of a keyed write that the caller decides row by
+    /// row, such as an upsert or a change guarded by a revision column: it finds
+    /// which rows exist and where, then removes some of them with
+    /// [`DuckLakeTableWriter::write_delete_file`](crate::DuckLakeTableWriter::write_delete_file)
+    /// over [`MatchedRows::deleted`] and the positions it picks, and commits
+    /// against [`Self::snapshot`] so a write in between conflicts. Only files
+    /// whose statistics allow a match are read (see [`Self::files_matching`]).
+    ///
+    /// `predicate` is resolved against [`Self::data_schema`]. A table holding
+    /// inlined rows is refused, as `UPDATE` refuses it: those rows are not in
+    /// any file, so they could not be found here.
+    #[cfg(feature = "write")]
+    pub async fn matching_rows(
+        &self,
+        state: &dyn Session,
+        predicate: &Arc<dyn PhysicalExpr>,
+    ) -> DataFusionResult<Vec<MatchedRows>> {
+        let inlined =
+            self.provider
+                .get_inlined_data(self.table_id, self.snapshot_id, &self.columns)?;
+        if inlined.iter().any(|batch| batch.num_rows() > 0) {
+            return Err(crate::DuckLakeError::Unsupported(format!(
+                "reading rows by position from a table with inlined rows is not supported; \
+                 {INLINED_DATA_REMEDIATION}"
+            ))
+            .into());
+        }
+        let inlined_deletes = self.inlined_deletes_by_file()?;
+        let out_schema = rewrite_output_schema(&self.physical_schema);
+        let mut matched = Vec::new();
+        for file in self
+            .files_matching(predicate)
+            .map_err(|error| DataFusionError::External(Box::new(error)))?
+        {
+            let scan = self
+                .build_update_scan_filtered(
+                    state,
+                    &file,
+                    inlined_deletes.get(&file.data_file_id),
+                    Some(predicate),
+                )
+                .await?;
+            let batches =
+                datafusion::physical_plan::collect(Arc::clone(&scan.scan), state.task_ctx())
+                    .await?;
+            let mut rows = Vec::new();
+            let mut positions = Vec::new();
+            for batch in &batches {
+                let Some(rewritten) = rewrite_scanned_batch(
+                    &self.physical_schema,
+                    &out_schema,
+                    &scan,
+                    batch,
+                    Some(predicate),
+                    &[],
+                )?
+                else {
+                    continue;
+                };
+                // Without the rowid the rewrite keeps last.
+                let columns =
+                    rewritten.batch.columns()[..self.physical_schema.fields().len()].to_vec();
+                rows.push(RecordBatch::try_new(self.physical_schema.clone(), columns)?);
+                positions.extend(rewritten.positions);
+            }
+            if positions.is_empty() {
+                continue;
+            }
+            matched.push(MatchedRows {
+                data_file_id: scan.data_file_id,
+                delete_file_id: scan.delete_file_id,
+                data_file_path: scan.source_path,
+                deleted: scan.existing_parquet_deletes.keys().copied().collect(),
+                rows: arrow::compute::concat_batches(&self.physical_schema, &rows)?,
+                positions,
+            });
+        }
+        Ok(matched)
+    }
+
+    /// The table's data columns, without the synthetic `rowid`: what
+    /// [`Self::matching_rows`] resolves its predicate against and returns.
+    pub fn data_schema(&self) -> SchemaRef {
+        self.physical_schema.clone()
+    }
+
+    /// The snapshot this table was read at.
+    pub fn snapshot(&self) -> i64 {
+        self.snapshot_id
+    }
+
     pub(crate) fn inlined_deletes_by_file(&self) -> DataFusionResult<HashMap<i64, HashSet<i64>>> {
         let deletes = self
             .provider
@@ -5178,6 +5272,26 @@ pub(crate) struct UpdateSourceScan {
     pub(crate) delete_file_id: Option<i64>,
     /// The source data file's catalog path (records the delete's provenance).
     pub(crate) source_path: String,
+}
+
+/// One data file's rows matching a predicate, from
+/// [`DuckLakeTable::matching_rows`].
+#[cfg(feature = "write")]
+#[derive(Debug, Clone)]
+pub struct MatchedRows {
+    /// The data file's catalog id, which a delete file of it targets.
+    pub data_file_id: i64,
+    /// The file's live delete file, which a new one must supersede, or `None`.
+    pub delete_file_id: Option<i64>,
+    /// The data file's catalog path, which a delete file of it records.
+    pub data_file_path: String,
+    /// The positions the file's live delete file already masks. A new delete
+    /// file carries them as well as its own.
+    pub deleted: HashSet<i64>,
+    /// The matching rows, in [`DuckLakeTable::data_schema`].
+    pub rows: RecordBatch,
+    /// Each row's physical position in the file, in the order of `rows`.
+    pub positions: Vec<i64>,
 }
 
 /// The rewrite produced for one source data file by

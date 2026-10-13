@@ -93,6 +93,28 @@ fn postgres_type_inlines(data_type: &DataType) -> bool {
     crate::nested_inline::type_supports_inlining(data_type)
 }
 
+/// Whether a PostgreSQL catalog can hold `schema`'s rows inline: every column has
+/// an inlined column type, and none collides with the inlined tables' own columns
+/// or exceeds PostgreSQL's 63-byte identifiers.
+pub(crate) fn postgres_supports_data_inlining(schema: &arrow::datatypes::Schema) -> bool {
+    !schema
+        .fields()
+        .iter()
+        .any(|field| is_inlined_system_column(field.name()) || field.name().len() > 63)
+        && schema
+            .fields()
+            .iter()
+            .all(|field| postgres_type_inlines(field.data_type()))
+}
+
+/// Whether every value in `batches` survives the inlined text round trip.
+pub(crate) fn postgres_supports_data_inlining_values(batches: &[RecordBatch]) -> bool {
+    batches
+        .iter()
+        .flat_map(RecordBatch::columns)
+        .all(|array| crate::nested_inline::values_support_inlining(array.as_ref()))
+}
+
 fn push_inlined_postgres_value(
     query: &mut QueryBuilder<Postgres>,
     array: &dyn Array,
@@ -1569,7 +1591,10 @@ pub(crate) async fn detect_new_inlined_deletes(
 /// record/byte totals. The `begin_snapshot < snapshot_id` guard leaves the
 /// current write's own files untouched (multi-file safety); `next_row_id` stays
 /// monotonic so rowids are never reused.
-async fn retire_prior_generation(
+/// Retire the prior generation's live data files and inlined rows at `snapshot_id`
+/// and zero the visible stat totals. The `begin_snapshot < snapshot_id` guard spares
+/// what this snapshot itself registers. `next_row_id` is left untouched.
+pub(crate) async fn retire_prior_generation(
     table_id: i64,
     snapshot_id: i64,
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -4023,24 +4048,11 @@ impl MetadataWriter for PostgresMetadataWriter {
 
     #[allow(clippy::too_many_arguments)]
     fn supports_data_inlining(&self, schema: &arrow::datatypes::Schema) -> bool {
-        if schema
-            .fields()
-            .iter()
-            .any(|field| is_inlined_system_column(field.name()) || field.name().len() > 63)
-        {
-            return false;
-        }
-        schema
-            .fields()
-            .iter()
-            .all(|field| postgres_type_inlines(field.data_type()))
+        postgres_supports_data_inlining(schema)
     }
 
     fn supports_data_inlining_values(&self, batches: &[RecordBatch]) -> bool {
-        batches
-            .iter()
-            .flat_map(RecordBatch::columns)
-            .all(|array| crate::nested_inline::values_support_inlining(array.as_ref()))
+        postgres_supports_data_inlining_values(batches)
     }
 
     #[allow(clippy::too_many_arguments)]

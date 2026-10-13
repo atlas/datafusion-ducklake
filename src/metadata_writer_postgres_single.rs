@@ -874,6 +874,116 @@ async fn record_table_changes(
     record_snapshot_changes(tx, snapshot_id, &changes.join(","), commit_metadata).await
 }
 
+/// One stage per table: a staged write cannot name its table twice.
+fn validate_one_stage_per_table(writes: &[StagedTableWrite]) -> Result<()> {
+    let ids = writes
+        .iter()
+        .map(|write| write.table_id)
+        .collect::<std::collections::HashSet<_>>();
+    if ids.len() != writes.len() {
+        return Err(crate::DuckLakeError::InvalidConfig(
+            "commit_multi_table requires one stage per table".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Commit `writes` at `snapshot_id` inside `tx`: each table's fence, files or
+/// inlined rows, deletes and change summary. Returns each table's committed ids.
+async fn commit_staged_writes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    snapshot_id: i64,
+    writes: &[StagedTableWrite],
+    commit_metadata: &SnapshotCommitMetadata,
+    expected_base_snapshot_id: Option<i64>,
+) -> Result<Vec<CommitIds>> {
+    let mut had_data = Vec::with_capacity(writes.len());
+    for write in writes {
+        // Official checks the table-level conflicts first.
+        check_staged_conflicts(tx, write, Some(snapshot_id)).await?;
+        validate_staged_table(tx, write).await?;
+        detect_row_mutation_conflicts(tx, write).await?;
+        if let Some(expected) = expected_base_snapshot_id {
+            detect_staged_conflict(write.table_id, expected, ConflictScope::of(write), tx).await?;
+        }
+        let files: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ducklake_data_file WHERE table_id = $1 AND end_snapshot IS NULL)").bind(write.table_id).fetch_one(&mut **tx).await?;
+        let mut inline = false;
+        for (name, system) in
+            crate::metadata_writer_postgres::inlined_tables(tx, write.table_id).await?
+        {
+            let sql = format!(
+                "SELECT EXISTS(SELECT 1 FROM {} WHERE {} IS NULL)",
+                quote_ident(&name),
+                system.end_snapshot,
+            );
+            inline |= sqlx::query_scalar::<_, bool>(AssertSqlSafe(sql))
+                .fetch_one(&mut **tx)
+                .await?;
+        }
+        had_data.push((files, inline));
+    }
+    let mut tables = Vec::with_capacity(writes.len());
+    for write in writes {
+        tables.push(
+            finalize_table_snapshot(
+                tx,
+                snapshot_id,
+                &write.schema_name,
+                &write.table_name,
+                write.table_id,
+                &write.columns,
+                &write.column_ids,
+                write.mode,
+                write.base_snapshot_id,
+                !matches!(write.data, StagedTableData::None),
+            )
+            .await?,
+        );
+    }
+    for ((write, ids), (files, inline)) in writes.iter().zip(&tables).zip(had_data) {
+        let mut write = write.clone();
+        write.table_id = ids.table_id;
+        match &write.data {
+            StagedTableData::Files(files) => {
+                commit_files_at_snapshot(tx, snapshot_id, &write, files).await?;
+            },
+            StagedTableData::Inlined(batches) => {
+                commit_inlined_at_snapshot(tx, snapshot_id, &write, batches).await?;
+            },
+            StagedTableData::None => {},
+        }
+        apply_positional_deletes_at_snapshot(
+            tx,
+            write.table_id,
+            snapshot_id,
+            write.base_snapshot_id,
+            &write.positional_deletes,
+        )
+        .await?;
+        apply_inlined_deletes_at_snapshot(
+            tx,
+            write.table_id,
+            snapshot_id,
+            write.base_snapshot_id,
+            &write.inlined_deletes,
+        )
+        .await?;
+        apply_row_mutation_at_snapshot(tx, snapshot_id, &write, None).await?;
+        let changes = staged_table_write_changes(&write, files, inline);
+        record_table_changes(
+            tx,
+            snapshot_id,
+            write.table_id,
+            &write.schema_name,
+            &write.table_name,
+            &changes,
+            commit_metadata,
+        )
+        .await?;
+    }
+    Ok(tables)
+}
+
 /// Bump the per-catalog monotonic `schema_version` on a DDL snapshot to
 /// `prev_max + 1` (max over the OTHER snapshots, so re-running is stable) and
 /// return the new value. Mirrors upstream `if (SchemaChangesMade()) schema_version++`.
@@ -1350,106 +1460,70 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 "commit_multi_table requires at least one table stage".to_string(),
             ));
         }
-        let ids = writes
-            .iter()
-            .map(|write| write.table_id)
-            .collect::<std::collections::HashSet<_>>();
-        if ids.len() != writes.len() {
-            return Err(crate::DuckLakeError::InvalidConfig(
-                "commit_multi_table requires one stage per table".to_string(),
-            ));
-        }
+        validate_one_stage_per_table(writes)?;
         // `initialize_schema` creates every catalog table, inlined data's included, so
         // a commit is DML alone and a login that may not create tables can make it.
         block_on(async {
             let mut tx = self.pool.begin().await?;
             let (snapshot_id, _) = insert_snapshot(&mut tx).await?;
-            let mut had_data = Vec::with_capacity(writes.len());
-            for write in writes {
-                // Official checks the table-level conflicts first.
-                check_staged_conflicts(&mut tx, write, Some(snapshot_id)).await?;
-                validate_staged_table(&mut tx, write).await?;
-                detect_row_mutation_conflicts(&mut tx, write).await?;
-                if let Some(expected) = expected_base_snapshot_id {
-                    detect_staged_conflict(
-                        write.table_id,
-                        expected,
-                        ConflictScope::of(write),
-                        &mut tx,
-                    )
-                    .await?;
-                }
-                let files: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ducklake_data_file WHERE table_id = $1 AND end_snapshot IS NULL)").bind(write.table_id).fetch_one(&mut *tx).await?;
-                let mut inline = false;
-                for (name, system) in
-                    crate::metadata_writer_postgres::inlined_tables(&mut tx, write.table_id).await?
-                {
-                    let sql = format!(
-                        "SELECT EXISTS(SELECT 1 FROM {} WHERE {} IS NULL)",
-                        quote_ident(&name),
-                        system.end_snapshot,
-                    );
-                    inline |= sqlx::query_scalar::<_, bool>(AssertSqlSafe(sql))
-                        .fetch_one(&mut *tx)
-                        .await?;
-                }
-                had_data.push((files, inline));
-            }
-            let mut tables = Vec::with_capacity(writes.len());
-            for write in writes {
-                tables.push(
-                    finalize_table_snapshot(
-                        &mut tx,
-                        snapshot_id,
-                        &write.schema_name,
-                        &write.table_name,
-                        write.table_id,
-                        &write.columns,
-                        &write.column_ids,
-                        write.mode,
-                        write.base_snapshot_id,
-                        !matches!(write.data, StagedTableData::None),
-                    )
-                    .await?,
-                );
-            }
-            for ((write, ids), (files, inline)) in writes.iter().zip(&tables).zip(had_data) {
-                let mut write = write.clone();
-                write.table_id = ids.table_id;
-                match &write.data {
-                    StagedTableData::Files(files) => {
-                        commit_files_at_snapshot(&mut tx, snapshot_id, &write, files).await?;
-                    },
-                    StagedTableData::Inlined(batches) => {
-                        commit_inlined_at_snapshot(&mut tx, snapshot_id, &write, batches).await?;
-                    },
-                    StagedTableData::None => {},
-                }
-                apply_positional_deletes_at_snapshot(
-                    &mut tx,
-                    write.table_id,
-                    snapshot_id,
-                    write.base_snapshot_id,
-                    &write.positional_deletes,
-                )
-                .await?;
-                apply_inlined_deletes_at_snapshot(
-                    &mut tx,
-                    write.table_id,
-                    snapshot_id,
-                    write.base_snapshot_id,
-                    &write.inlined_deletes,
-                )
-                .await?;
-                apply_row_mutation_at_snapshot(&mut tx, snapshot_id, &write, None).await?;
-                let changes = staged_table_write_changes(&write, files, inline);
-                record_table_changes(
+            let tables = commit_staged_writes(
+                &mut tx,
+                snapshot_id,
+                writes,
+                commit_metadata,
+                expected_base_snapshot_id,
+            )
+            .await?;
+            self.commit_networked(tx).await?;
+            Ok(MultiTableCommit {
+                snapshot_id,
+                tables,
+            })
+        })
+    }
+
+    fn commit_overlay(
+        &self,
+        overlay: &crate::overlay::OverlayCommit,
+        writes: &[StagedTableWrite],
+        commit_metadata: &SnapshotCommitMetadata,
+        expected_base_snapshot_id: Option<i64>,
+    ) -> Result<MultiTableCommit> {
+        validate_one_stage_per_table(writes)?;
+        // `initialize_schema` creates the overlay tables too, so this is DML alone.
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            let (snapshot_id, _) = insert_snapshot(&mut tx).await?;
+            let tables = commit_staged_writes(
+                &mut tx,
+                snapshot_id,
+                writes,
+                commit_metadata,
+                expected_base_snapshot_id,
+            )
+            .await?;
+            // A staged write's reserved table id becomes its committed one.
+            let overlay_table_id = writes
+                .iter()
+                .zip(&tables)
+                .find(|(write, _)| write.table_id == overlay.overlay_table_id)
+                .map_or(overlay.overlay_table_id, |(_, ids)| ids.table_id);
+            crate::overlay_postgres::apply_overlay_at_snapshot(
+                &mut tx,
+                snapshot_id,
+                overlay_table_id,
+                overlay,
+                expected_base_snapshot_id,
+            )
+            .await?;
+            if !overlay.hide.is_empty()
+                || !overlay.hide_inlined.is_empty()
+                || overlay.create.is_some()
+            {
+                record_snapshot_changes(
                     &mut tx,
                     snapshot_id,
-                    write.table_id,
-                    &write.schema_name,
-                    &write.table_name,
-                    &changes,
+                    &format!("overlay_changed:{overlay_table_id}"),
                     commit_metadata,
                 )
                 .await?;
@@ -2919,6 +2993,10 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             for upgrade in SQL_UPGRADE_TO_1_0 {
                 sqlx::query(*upgrade).execute(&self.pool).await?;
             }
+            // Overlays' own tables, so an overlay commit is DML alone.
+            sqlx::raw_sql(crate::overlay_postgres::SQL_CREATE_OVERLAY_TABLES)
+                .execute(&self.pool)
+                .await?;
             sqlx::query("ALTER TABLE ducklake_metadata ADD COLUMN IF NOT EXISTS scope VARCHAR")
                 .execute(&self.pool)
                 .await?;

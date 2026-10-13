@@ -80,6 +80,28 @@ impl LakePool {
         Ok(connection)
     }
 
+    /// Waits for `table`'s write lock in this lake and holds it until the
+    /// returned lock is released or dropped.
+    ///
+    /// Nothing in this crate takes it. It is for callers whose writes to one
+    /// table must not interleave, such as a keyed write that reads which keys
+    /// exist and then commits: without it, a write committed in between makes
+    /// the second one conflict. Lakes in other schemas lock their tables apart.
+    /// The lock is keyed by a hash of the schema and the name, so two tables
+    /// whose hashes collide wait for each other, which delays but never breaks
+    /// them.
+    pub async fn lock_table(&self, table: &str) -> Result<TableLock, sqlx::Error> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
+            .bind(self.search_path.as_deref().unwrap_or_default())
+            .bind(table)
+            .execute(&mut *transaction)
+            .await?;
+        Ok(TableLock {
+            transaction,
+        })
+    }
+
     /// A transaction whose unqualified names reach this lake.
     pub async fn begin(&self) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
         let mut transaction = self.pool.begin().await?;
@@ -90,6 +112,24 @@ impl LakePool {
                 .await?;
         }
         Ok(transaction)
+    }
+}
+
+/// One table's write lock, held until it is dropped or released.
+///
+/// It is a transaction-scoped advisory lock on a connection of its own, so it is
+/// released when the transaction ends, however the holder ends: a dropped lock
+/// rolls back when its connection goes back to the pool, and a connection that
+/// is lost takes the lock with it.
+#[derive(Debug)]
+pub struct TableLock {
+    transaction: Transaction<'static, Postgres>,
+}
+
+impl TableLock {
+    /// Releases the lock now, rather than when the connection is next used.
+    pub async fn release(self) -> Result<(), sqlx::Error> {
+        self.transaction.rollback().await
     }
 }
 

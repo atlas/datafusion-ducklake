@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, Int64Array, RecordBatch, StringArray, UInt64Array};
+use arrow::array::{Array, Int64Array, RecordBatch, StringArray, StringViewArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
@@ -15,10 +15,15 @@ use testcontainers::ContainerAsync;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
-use datafusion_ducklake::metadata_writer::{DeleteFileEntry, DeleteFileInfo, MetadataWriter};
+use datafusion::catalog::CatalogProvider;
+use datafusion::common::DFSchema;
+use datafusion_ducklake::metadata_writer::{
+    DeleteFileEntry, DeleteFileInfo, MetadataWriter, WriteMode,
+};
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeError, DuckLakeTableWriter, LakePool, PostgresMetadataProvider,
-    PostgresSingleCatalogMetadataWriter, register_ducklake_functions,
+    DuckLakeCatalog, DuckLakeError, DuckLakeTable, DuckLakeTableWriter, LakePool,
+    PostgresMetadataProvider, PostgresSingleCatalogMetadataWriter, TableWriteOptions,
+    register_ducklake_functions,
 };
 
 const LAKE: &str = "lake";
@@ -218,6 +223,163 @@ async fn a_delete_read_against_a_superseded_delete_file_conflicts() {
         "the refused delete left a snapshot"
     );
     assert_eq!(delete_files(&pool).await, [(1, None)]);
+}
+
+/// `main.t` as the lake has it now, read only.
+async fn table(pool: &PgPool) -> Arc<dyn datafusion::catalog::TableProvider> {
+    let provider = provider(pool);
+    let catalog = tokio::task::spawn_blocking(move || DuckLakeCatalog::new(provider).unwrap())
+        .await
+        .unwrap();
+    catalog
+        .schema("main")
+        .unwrap()
+        .table("t")
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_keyed_write_reads_the_live_rows_it_names_and_commits_once() {
+    let (pool, _container) = database().await.unwrap();
+    let data = TempDir::new().unwrap();
+    seed(&pool, &data).await;
+    let ctx = session(&pool, &data).await;
+    affected(&ctx, "DELETE FROM lake.main.t WHERE id = 3").await;
+    let base = head(&pool).await;
+
+    let provider = table(&pool).await;
+    let table = provider.downcast_ref::<DuckLakeTable>().unwrap();
+    assert_eq!(table.snapshot(), base);
+    let schema = DFSchema::try_from(table.data_schema().as_ref().clone()).unwrap();
+    let predicate = ctx
+        .state()
+        .create_physical_expr(
+            col("id").in_list(vec![lit(2_i64), lit(3_i64), lit(9_i64)], false),
+            &schema,
+        )
+        .unwrap();
+    let matched = table.matching_rows(&ctx.state(), &predicate).await.unwrap();
+
+    // Row 3 is deleted and 9 was never written, so only row 2, at position 1.
+    let [file] = matched.as_slice() else {
+        panic!("{matched:?}");
+    };
+    assert_eq!(file.positions, [1]);
+    assert_eq!(file.deleted, [2].into());
+    let ids = file
+        .rows
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(ids.values().as_ref(), [2]);
+
+    // Replace row 2 and add row 9 in one snapshot, against the snapshot read.
+    let writer =
+        DuckLakeTableWriter::new(writer(&pool, &data).await, Arc::new(LocalFileSystem::new()))
+            .unwrap();
+    let batch = |ids: Vec<i64>, names: Vec<&str>| {
+        RecordBatch::try_new(
+            table.data_schema(),
+            vec![Arc::new(Int64Array::from(ids)), Arc::new(StringViewArray::from(names))],
+        )
+        .unwrap()
+    };
+    let delete = writer
+        .write_delete_file("main", "t", &file.data_file_path, &[1, 2])
+        .await
+        .unwrap();
+    let entry = DeleteFileEntry {
+        data_file_id: file.data_file_id,
+        expected_prev_delete_file: file.delete_file_id,
+        delete,
+    };
+    let at_base = TableWriteOptions::new().with_expected_base_snapshot_id(base);
+    let mut transaction = writer.transaction().with_options(&at_base);
+    transaction
+        .stage_write_with_deletes(
+            "main",
+            "t",
+            &table.data_schema(),
+            WriteMode::Append,
+            &[batch(vec![2, 9], vec!["B", "i"])],
+            &[entry],
+            &[],
+        )
+        .await
+        .unwrap();
+    let committed = transaction.commit().await.unwrap();
+    assert_eq!(committed[0].snapshot_id, base + 1);
+    assert_eq!(
+        rows(&ctx, "SELECT id, name FROM lake.main.t ORDER BY id").await,
+        [(1, "a".into()), (2, "B".into()), (4, "d".into()), (9, "i".into())]
+    );
+
+    // A second write read at the same snapshot finds the table moved on.
+    let mut stale = writer.transaction().with_options(&at_base);
+    stale
+        .stage_write(
+            "main",
+            "t",
+            &table.data_schema(),
+            WriteMode::Append,
+            &[batch(vec![10], vec!["j"])],
+        )
+        .await
+        .unwrap();
+    let refused = stale.commit().await;
+    assert!(
+        matches!(refused, Err(DuckLakeError::Conflict(_))),
+        "{refused:?}"
+    );
+    assert_eq!(head(&pool).await, base + 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_table_lock_holds_the_tables_other_writers_off() {
+    let (pool, _container) = database().await.unwrap();
+    let lake = LakePool::in_schema(pool.clone(), LAKE);
+    let other_lake = LakePool::in_schema(pool.clone(), "other");
+    let wait = std::time::Duration::from_millis(300);
+
+    let held = lake.lock_table("main.t").await.unwrap();
+    // Another table, and the same table in another lake, are not held.
+    lake.lock_table("main.u")
+        .await
+        .unwrap()
+        .release()
+        .await
+        .unwrap();
+    other_lake
+        .lock_table("main.t")
+        .await
+        .unwrap()
+        .release()
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(wait, lake.lock_table("main.t"))
+            .await
+            .is_err(),
+        "a second holder took a held lock"
+    );
+
+    held.release().await.unwrap();
+    tokio::time::timeout(wait, lake.lock_table("main.t"))
+        .await
+        .expect("the released lock is free")
+        .unwrap();
+
+    // A dropped lock is released as well.
+    drop(lake.lock_table("main.v").await.unwrap());
+    tokio::time::timeout(std::time::Duration::from_secs(5), lake.lock_table("main.v"))
+        .await
+        .expect("the dropped lock is free")
+        .unwrap();
 }
 
 #[cfg(feature = "metadata-duckdb")]

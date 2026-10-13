@@ -88,6 +88,7 @@ mod positional_pushdown_tests;
 mod postgres_geometry_tests;
 mod postgres_lake_schema_tests;
 mod postgres_metadata_provider_test;
+mod postgres_overlay_tests;
 mod postgres_single_catalog_write_tests;
 mod postgres_single_deletes_tests;
 mod pushdown_row_preservation_tests;

@@ -83,6 +83,7 @@ pub mod metadata_provider;
 pub(crate) mod nan_pruning_barrier;
 mod nested_inline;
 pub(crate) mod open_time_filter_barrier;
+pub mod overlay;
 pub mod partition;
 pub mod path_resolver;
 pub mod row_id;
@@ -110,6 +111,8 @@ pub mod metadata_provider_mysql;
 pub mod metadata_provider_postgres;
 #[cfg(feature = "metadata-sqlite")]
 pub mod metadata_provider_sqlite;
+#[cfg(feature = "metadata-postgres")]
+pub mod overlay_postgres;
 
 // Write support (feature-gated)
 #[cfg(feature = "write")]

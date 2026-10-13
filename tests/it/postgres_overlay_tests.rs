@@ -18,6 +18,7 @@ use testcontainers_modules::postgres::Postgres;
 use datafusion_ducklake::metadata_writer::MetadataWriter;
 use datafusion_ducklake::overlay::{
     DuckLakeOverlayTable, OverlayBase, OverlayBaseProvider, create_overlay, flush_overlay,
+    plan_rebase, rebase_overlay,
 };
 use datafusion_ducklake::overlay_postgres::{initialize_overlay_schema, load_overlay_base};
 use datafusion_ducklake::{
@@ -308,6 +309,71 @@ impl Lake {
         flush_overlay(&table, &self.table_writer(writer), "main", &ctx.state())
             .await
             .unwrap()
+    }
+
+    /// Plans rebasing the overlay `name` onto the underlay's head, and
+    /// returns the plan's conflicting ids, sorted.
+    async fn conflicts(&self, name: &str) -> Vec<i64> {
+        let (plan, _, _) = self.plan(name).await;
+        let mut ids = plan
+            .conflicts
+            .iter()
+            .map(|key| match key {
+                datafusion::common::ScalarValue::Int64(Some(id)) => *id,
+                other => panic!("an id key, not {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    }
+
+    async fn plan(
+        &self,
+        name: &str,
+    ) -> (
+        datafusion_ducklake::overlay::OverlayRebase,
+        DuckLakeOverlayTable,
+        Arc<DuckLakeTable>,
+    ) {
+        let table = self.writable_overlay(name).await;
+        let base = table.base().base_snapshot;
+        let old = self.table_at(self.provider(), base, "t").await;
+        let new = self.table_at(self.provider(), self.head().await, "t").await;
+        let ctx = SessionContext::new();
+        let plan = plan_rebase(&table, &old, &new, "id", &ctx.state())
+            .await
+            .unwrap();
+        (plan, table, new)
+    }
+
+    /// Rebases the overlay `name` onto the underlay's head, taking the
+    /// underlay's version of `take_underlay`.
+    async fn rebase(&self, name: &str, take_underlay: &[i64]) -> datafusion_ducklake::Result<i64> {
+        let (plan, table, new) = self.plan(name).await;
+        self.apply(&table, &plan, &new, take_underlay).await
+    }
+
+    async fn apply(
+        &self,
+        table: &DuckLakeOverlayTable,
+        plan: &datafusion_ducklake::overlay::OverlayRebase,
+        new: &DuckLakeTable,
+        take_underlay: &[i64],
+    ) -> datafusion_ducklake::Result<i64> {
+        let take = take_underlay
+            .iter()
+            .map(|id| datafusion::common::ScalarValue::Int64(Some(*id)))
+            .collect();
+        let ctx = SessionContext::new();
+        rebase_overlay(
+            table,
+            plan,
+            new,
+            &take,
+            &self.table_writer(self.writer().await),
+            &ctx.state(),
+        )
+        .await
     }
 
     async fn count(&self, sql: &str) -> i64 {
@@ -825,5 +891,124 @@ async fn a_flush_folds_what_an_overlay_holds_inline_into_files() {
     assert_eq!(
         rows(lake.overlay("o", lake.head().await).await).await,
         expected(&[(1, "A"), (5, "e")])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_rebase_without_conflicts_brings_in_the_underlays_changes() {
+    let lake = Lake::start().await;
+    lake.write("t", &[1, 2, 3, 4], &["a", "b", "c", "d"]).await;
+    let (_, overlay) = lake.create("o").await;
+    lake.change("o", "UPDATE ov SET name = 'B' WHERE id = 2")
+        .await
+        .unwrap();
+    lake.change("o", "DELETE FROM ov WHERE id = 3")
+        .await
+        .unwrap();
+    lake.change("o", "INSERT INTO ov VALUES (5, 'e')")
+        .await
+        .unwrap();
+    lake.sql("UPDATE lake.main.t SET name = 'A' WHERE id = 1")
+        .await;
+    lake.sql("INSERT INTO lake.main.t VALUES (6, 'f')").await;
+    lake.sql("DELETE FROM lake.main.t WHERE id = 4").await;
+    let underlay_head = lake.head().await;
+
+    assert_eq!(lake.conflicts("o").await, Vec::<i64>::new());
+    let rebased = lake.rebase("o", &[]).await.unwrap();
+
+    assert_eq!(
+        rows(lake.overlay("o", rebased).await).await,
+        expected(&[(1, "A"), (2, "B"), (5, "e"), (6, "f")])
+    );
+    assert_eq!(
+        lake.count(&format!(
+            "SELECT base_snapshot FROM lake.ducklake_overlay
+             WHERE overlay_table_id = {overlay} AND end_snapshot IS NULL"
+        ))
+        .await,
+        underlay_head
+    );
+    // Writes after the rebase act on the new base.
+    lake.change("o", "UPDATE ov SET name = 'F' WHERE id = 6")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(lake.overlay("o", lake.head().await).await).await,
+        expected(&[(1, "A"), (2, "B"), (5, "e"), (6, "F")])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_rebase_resolves_each_conflict_one_way_or_the_other() {
+    let lake = Lake::start().await;
+    lake.write("t", &[1, 2, 3], &["a", "b", "c"]).await;
+    lake.create("o").await;
+    lake.change("o", "UPDATE ov SET name = 'mine' WHERE id = 1")
+        .await
+        .unwrap();
+    lake.change("o", "DELETE FROM ov WHERE id = 2")
+        .await
+        .unwrap();
+    lake.change("o", "INSERT INTO ov VALUES (7, 'mine')")
+        .await
+        .unwrap();
+    lake.sql("UPDATE lake.main.t SET name = 'theirs' WHERE id IN (1, 2)")
+        .await;
+    lake.sql("INSERT INTO lake.main.t VALUES (7, 'theirs')")
+        .await;
+
+    assert_eq!(lake.conflicts("o").await, vec![1, 2, 7]);
+    // Keep the overlay's 1 and 7; take the underlay's 2.
+    let rebased = lake.rebase("o", &[2]).await.unwrap();
+    assert_eq!(
+        rows(lake.overlay("o", rebased).await).await,
+        expected(&[(1, "mine"), (2, "theirs"), (3, "c"), (7, "mine")])
+    );
+    assert_eq!(lake.conflicts("o").await, Vec::<i64>::new(), "settled");
+
+    // Taking the underlay's version drops the overlay's row for it.
+    lake.sql("UPDATE lake.main.t SET name = 'again' WHERE id = 7")
+        .await;
+    assert_eq!(lake.conflicts("o").await, vec![7]);
+    let rebased = lake.rebase("o", &[7]).await.unwrap();
+    assert_eq!(
+        rows(lake.overlay("o", rebased).await).await,
+        expected(&[(1, "mine"), (2, "theirs"), (3, "c"), (7, "again")])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_rebase_after_a_flush_and_a_stale_plan() {
+    let lake = Lake::start().await;
+    lake.write("t", &[1, 2, 3], &["a", "b", "c"]).await;
+    lake.create("o").await;
+    lake.change("o", "DELETE FROM ov WHERE id = 2")
+        .await
+        .unwrap();
+    lake.flush().await.unwrap();
+    lake.sql("DELETE FROM lake.main.t WHERE id = 3").await;
+
+    // A plan the overlay moved past is refused.
+    let (plan, table, new) = lake.plan("o").await;
+    lake.change("o", "INSERT INTO ov VALUES (4, 'd')")
+        .await
+        .unwrap();
+    let before = lake.head().await;
+    let error = lake.apply(&table, &plan, &new, &[]).await.unwrap_err();
+    assert!(
+        matches!(error, datafusion_ducklake::DuckLakeError::Conflict(_)),
+        "{error}"
+    );
+    assert_eq!(lake.head().await, before);
+
+    // Replanned, the flushed delete is carried to the new base.
+    let rebased = lake.rebase("o", &[]).await.unwrap();
+    assert_eq!(
+        rows(lake.overlay("o", rebased).await).await,
+        expected(&[(1, "a"), (4, "d")])
     );
 }

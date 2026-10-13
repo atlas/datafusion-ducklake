@@ -258,7 +258,7 @@ pub(crate) async fn apply_overlay_at_snapshot(
         )));
     };
     let underlay_table_id: i64 = row.try_get(0)?;
-    let base_snapshot: i64 = row.try_get(1)?;
+    let mut base_snapshot: i64 = row.try_get(1)?;
 
     if let Some(expected) = expected_base_snapshot_id {
         let changed: bool = sqlx::query_scalar(
@@ -281,6 +281,19 @@ pub(crate) async fn apply_overlay_at_snapshot(
                  retry the write against the new state"
             )));
         }
+    }
+
+    if let Some(new_base) = commit.rebase {
+        rebase_at_snapshot(
+            tx,
+            snapshot_id,
+            overlay_table_id,
+            underlay_table_id,
+            base_snapshot,
+            new_base,
+        )
+        .await?;
+        base_snapshot = new_base;
     }
 
     hide_inlined_rows(
@@ -486,6 +499,69 @@ async fn apply_fold(
     .bind(snapshot_id)
     .bind(overlay_table_id)
     .bind(fold.data_file_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Moves the overlay's base to `new_base` at `snapshot_id`: ends its base row
+/// and begins one at the new base, and ends everything it hid at the old one.
+#[cfg(feature = "write-postgres")]
+async fn rebase_at_snapshot(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    snapshot_id: i64,
+    overlay_table_id: i64,
+    underlay_table_id: i64,
+    base_snapshot: i64,
+    new_base: i64,
+) -> Result<()> {
+    use crate::DuckLakeError;
+
+    if new_base < base_snapshot {
+        return Err(DuckLakeError::InvalidConfig(format!(
+            "overlay {overlay_table_id} cannot rebase back from snapshot {base_snapshot} \
+             to {new_base}"
+        )));
+    }
+    let underlay_live: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM ducklake_table
+             WHERE table_id = $1 AND begin_snapshot <= $2
+               AND (end_snapshot IS NULL OR $2 < end_snapshot))",
+    )
+    .bind(underlay_table_id)
+    .bind(new_base)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !underlay_live {
+        return Err(DuckLakeError::TableNotFound(format!(
+            "underlay {underlay_table_id} at snapshot {new_base}"
+        )));
+    }
+    for statement in [
+        "UPDATE ducklake_overlay SET end_snapshot = $1
+         WHERE overlay_table_id = $2 AND end_snapshot IS NULL",
+        "UPDATE ducklake_overlay_inlined_delete SET end_snapshot = $1
+         WHERE overlay_table_id = $2 AND end_snapshot IS NULL",
+        "UPDATE ducklake_overlay_inlined_row_delete SET end_snapshot = $1
+         WHERE overlay_table_id = $2 AND end_snapshot IS NULL",
+        "UPDATE ducklake_overlay_delete_file SET end_snapshot = $1
+         WHERE overlay_table_id = $2 AND end_snapshot IS NULL",
+    ] {
+        sqlx::query(statement)
+            .bind(snapshot_id)
+            .bind(overlay_table_id)
+            .execute(&mut **tx)
+            .await?;
+    }
+    sqlx::query(
+        "INSERT INTO ducklake_overlay
+             (overlay_table_id, underlay_table_id, base_snapshot, begin_snapshot)
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(overlay_table_id)
+    .bind(underlay_table_id)
+    .bind(new_base)
+    .bind(snapshot_id)
     .execute(&mut **tx)
     .await?;
     Ok(())

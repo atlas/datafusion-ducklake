@@ -90,16 +90,26 @@ impl LakePool {
     /// The lock is keyed by a hash of the schema and the name, so two tables
     /// whose hashes collide wait for each other, which delays but never breaks
     /// them.
+    ///
+    /// The wait runs on the catalog runtime, like every other use of the pool, so
+    /// a connection it opens never belongs to the caller's runtime. A caller that
+    /// stops waiting leaves it to finish there and release the lock at once.
     pub async fn lock_table(&self, table: &str) -> Result<TableLock, sqlx::Error> {
-        let mut transaction = self.pool.begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
-            .bind(self.search_path.as_deref().unwrap_or_default())
-            .bind(table)
-            .execute(&mut *transaction)
-            .await?;
-        Ok(TableLock {
-            transaction,
+        let pool = self.pool.clone();
+        let schema = self.search_path.clone().unwrap_or_default();
+        let table = table.to_string();
+        crate::metadata_provider::connect_on_catalog_runtime(async move {
+            let mut transaction = pool.begin().await?;
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
+                .bind(schema)
+                .bind(table)
+                .execute(&mut *transaction)
+                .await?;
+            Ok(TableLock {
+                transaction,
+            })
         })
+        .await
     }
 
     /// A transaction whose unqualified names reach this lake.

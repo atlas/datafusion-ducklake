@@ -352,6 +352,76 @@ async fn a_keyed_write_reads_the_live_rows_it_names_and_commits_once() {
     assert_eq!(head(&pool).await, base + 1);
 }
 
+/// Every file under `dir`, however deep.
+fn files_under(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .map(|path| {
+            if path.is_dir() {
+                files_under(&path)
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_delete_file_handed_to_a_stage_that_fails_is_removed() {
+    let (pool, _container) = database().await.unwrap();
+    let data = TempDir::new().unwrap();
+    seed(&pool, &data).await;
+    let files = files_under(data.path());
+    let writer =
+        DuckLakeTableWriter::new(writer(&pool, &data).await, Arc::new(LocalFileSystem::new()))
+            .unwrap();
+    let data_file: (i64, String) =
+        sqlx::query_as("SELECT data_file_id, path FROM lake.ducklake_data_file")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let delete = writer
+        .write_delete_file("main", "t", &data_file.1, &[0])
+        .await
+        .unwrap();
+    assert_eq!(files_under(data.path()), files + 1);
+
+    // A null id, which the table does not allow, fails the stage.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("name", DataType::Utf8View, true),
+    ]));
+    let rows = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![None::<i64>])),
+            Arc::new(StringViewArray::from(vec!["x"])),
+        ],
+    )
+    .unwrap();
+    let entry = DeleteFileEntry {
+        data_file_id: data_file.0,
+        expected_prev_delete_file: None,
+        delete,
+    };
+    let mut transaction = writer.transaction();
+    let staged = transaction
+        .stage_write_with_deletes(
+            "main",
+            "t",
+            &schema,
+            WriteMode::Append,
+            &[rows],
+            &[entry],
+            &[],
+        )
+        .await;
+    assert!(staged.is_err(), "{staged:?}");
+    assert_eq!(files_under(data.path()), files, "the delete file was left");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn a_table_lock_holds_the_tables_other_writers_off() {

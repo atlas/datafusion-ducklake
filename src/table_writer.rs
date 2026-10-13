@@ -2928,8 +2928,19 @@ impl DuckLakeWriteTransaction<'_> {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        self.stage_write(schema_name, table_name, arrow_schema, mode, batches)
-            .await?;
+        if let Err(e) = self
+            .stage_write(schema_name, table_name, arrow_schema, mode, batches)
+            .await
+        {
+            // The delete files were handed over with this call, and will never
+            // be committed now, so nothing else would remove them.
+            for path in &delete_paths {
+                if let Err(cleanup) = self.writer.object_store.delete(path).await {
+                    tracing::warn!(%path, error = %cleanup, "a staged delete file was not removed");
+                }
+            }
+            return Err(e);
+        }
         let prepared = self
             .writes
             .last_mut()

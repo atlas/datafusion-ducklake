@@ -1494,6 +1494,20 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
         block_on(async {
             let mut tx = self.pool.begin().await?;
             let (snapshot_id, _) = insert_snapshot(&mut tx).await?;
+            // The overlay is its table as well as what it hides: a change to the
+            // table since the read conflicts even when this commit stages none.
+            // Checked before this commit's own stages land.
+            if let Some(expected) = expected_base_snapshot_id
+                && overlay.create.is_none()
+            {
+                detect_staged_conflict(
+                    overlay.overlay_table_id,
+                    expected,
+                    ConflictScope::Table,
+                    &mut tx,
+                )
+                .await?;
+            }
             let tables = commit_staged_writes(
                 &mut tx,
                 snapshot_id,

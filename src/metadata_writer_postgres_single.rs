@@ -1265,10 +1265,9 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 "commit_multi_table requires one stage per table".to_string(),
             ));
         }
+        // `initialize_schema` creates every catalog table, inlined data's included, so
+        // a commit is DML alone and a login that may not create tables can make it.
         block_on(async {
-            sqlx::query(SQL_CREATE_INLINED_DATA_TABLES)
-                .execute(&self.pool)
-                .await?;
             let mut tx = self.pool.begin().await?;
             let (snapshot_id, _) = insert_snapshot(&mut tx).await?;
             let mut had_data = Vec::with_capacity(writes.len());

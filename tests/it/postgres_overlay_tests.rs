@@ -16,7 +16,7 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
 use datafusion_ducklake::metadata_writer::MetadataWriter;
-use datafusion_ducklake::overlay::{DuckLakeOverlayTable, OverlayBaseProvider};
+use datafusion_ducklake::overlay::{DuckLakeOverlayTable, OverlayBaseProvider, create_overlay};
 use datafusion_ducklake::overlay_postgres::{initialize_overlay_schema, load_overlay_base};
 use datafusion_ducklake::{
     DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter, LakePool, MetadataProvider,
@@ -222,6 +222,85 @@ impl Lake {
             .await;
         let overlay = self.table_at(self.provider(), snapshot, name).await;
         DuckLakeOverlayTable::try_new(underlay, overlay).unwrap()
+    }
+}
+
+impl Lake {
+    /// The overlay `name` as it is now, writable.
+    async fn writable_overlay(&self, name: &str) -> DuckLakeOverlayTable {
+        let provider = self.provider();
+        let writer = self.writer().await;
+        let catalog = DuckLakeCatalog::with_writer(provider.clone(), writer).unwrap();
+        let table: Arc<dyn TableProvider> = catalog
+            .schema("main")
+            .unwrap()
+            .table(name)
+            .await
+            .unwrap()
+            .unwrap();
+        let overlay = (table.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<DuckLakeTable>()
+            .unwrap()
+            .clone();
+        let base = load_overlay_base(
+            &self.lake_pool(),
+            self.table_id(name).await,
+            overlay.snapshot(),
+        )
+        .await
+        .unwrap()
+        .expect("an overlay");
+        let (base_snapshot, underlay_id) = (base.base_snapshot, base.underlay_table_id);
+        let underlay_name: String =
+            sqlx::query_scalar("SELECT table_name FROM lake.ducklake_table WHERE table_id = $1")
+                .bind(underlay_id)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap();
+        let base_provider = Arc::new(OverlayBaseProvider::new(provider, Arc::new(base)));
+        let underlay = self
+            .table_at(base_provider, base_snapshot, &underlay_name)
+            .await;
+        DuckLakeOverlayTable::try_new(underlay, Arc::new(overlay)).unwrap()
+    }
+
+    /// Runs one DML statement on the overlay `name` as `ov`; returns its count.
+    async fn change(&self, name: &str, sql: &str) -> datafusion::error::Result<u64> {
+        let ctx = SessionContext::new();
+        ctx.register_table("ov", Arc::new(self.writable_overlay(name).await))
+            .unwrap();
+        let batches = ctx.sql(sql).await?.collect().await?;
+        Ok(batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .unwrap()
+            .value(0))
+    }
+
+    /// Creates the overlay `name` of `main.t` as it is now.
+    async fn create(&self, name: &str) -> (i64, i64) {
+        let underlay = self.table_at(self.provider(), self.head().await, "t").await;
+        let writer = self.writer().await;
+        let (snapshot, table_id) =
+            create_overlay(&self.table_writer(writer.clone()), "main", name, &underlay)
+                .await
+                .unwrap();
+        tokio::task::spawn_blocking(move || {
+            writer
+                .set_table_setting(table_id, "data_inlining_row_limit", "10")
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        (snapshot, table_id)
+    }
+
+    async fn count(&self, sql: &str) -> i64 {
+        sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_string()))
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
     }
 }
 
@@ -450,4 +529,175 @@ fn an_overlay_base_is_read_on_the_catalog_runtime() {
     setup.block_on(async move { drop(lake) });
     read.expect("the catalog call finishes")
         .expect("the catalog call reads");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn an_overlay_takes_inserts_updates_and_deletes_without_touching_its_underlay() {
+    let lake = Lake::start().await;
+    lake.write("t", &[1, 2, 3, 4], &["a", "b", "c", "d"]).await;
+    let underlay_files = lake
+        .count("SELECT COUNT(*) FROM lake.ducklake_data_file")
+        .await;
+    let (created, overlay) = lake.create("o").await;
+    let underlay = lake.table_id("t").await;
+    assert_eq!(
+        lake.count(&format!(
+            "SELECT COUNT(*) FROM lake.ducklake_overlay WHERE overlay_table_id = {overlay}
+               AND underlay_table_id = {underlay} AND begin_snapshot = {created}"
+        ))
+        .await,
+        1,
+        "the table and its overlay row begin in one snapshot"
+    );
+
+    assert_eq!(
+        lake.change("o", "UPDATE ov SET name = 'B' WHERE id = 2")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        lake.change("o", "DELETE FROM ov WHERE id = 3")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        lake.change("o", "INSERT INTO ov VALUES (5, 'e')")
+            .await
+            .unwrap(),
+        1
+    );
+    // Rows the overlay already holds change in the overlay table only.
+    assert_eq!(
+        lake.change("o", "UPDATE ov SET name = 'BB' WHERE id = 2")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        lake.change("o", "DELETE FROM ov WHERE id = 5")
+            .await
+            .unwrap(),
+        1
+    );
+    // Nothing matches twice.
+    assert_eq!(
+        lake.change("o", "DELETE FROM ov WHERE id = 3")
+            .await
+            .unwrap(),
+        0
+    );
+
+    assert_eq!(
+        rows(lake.overlay("o", lake.head().await).await).await,
+        expected(&[(1, "a"), (2, "BB"), (4, "d")])
+    );
+    assert_eq!(
+        lake.count(&format!(
+            "SELECT COUNT(*) FROM lake.ducklake_overlay_inlined_delete
+             WHERE overlay_table_id = {overlay} AND end_snapshot IS NULL"
+        ))
+        .await,
+        2,
+        "two underlay rows hidden, each once"
+    );
+    assert_eq!(
+        lake.count("SELECT COUNT(*) FROM lake.ducklake_data_file")
+            .await,
+        underlay_files,
+        "small overlay edits are inlined"
+    );
+    // The underlay is untouched.
+    let head = lake.head().await;
+    let plain = lake.table_at(lake.provider(), head, "t").await;
+    assert_eq!(
+        rows(DuckLakeTable::clone(&plain)).await,
+        expected(&[(1, "a"), (2, "b"), (3, "c"), (4, "d")])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn an_update_reaching_both_parts_commits_one_snapshot() {
+    let lake = Lake::start().await;
+    lake.write("t", &[1, 2, 3], &["a", "b", "c"]).await;
+    lake.create("o").await;
+    lake.change("o", "INSERT INTO ov VALUES (9, 'i')")
+        .await
+        .unwrap();
+    let before = lake.head().await;
+
+    assert_eq!(
+        lake.change("o", "UPDATE ov SET name = 'x' WHERE id IN (1, 9)")
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(lake.head().await, before + 1);
+    assert_eq!(
+        rows(lake.overlay("o", lake.head().await).await).await,
+        expected(&[(1, "x"), (2, "b"), (3, "c"), (9, "x")])
+    );
+    assert_eq!(
+        rows(lake.overlay("o", before).await).await,
+        expected(&[(1, "a"), (2, "b"), (3, "c"), (9, "i")])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn an_overlay_writes_against_its_base_whatever_its_underlay_did_since() {
+    let lake = Lake::start().await;
+    lake.write("t", &[1, 2], &["a", "b"]).await;
+    lake.create("o").await;
+    lake.sql("DELETE FROM lake.main.t WHERE id = 1").await;
+    lake.sql("INSERT INTO lake.main.t VALUES (3, 'c')").await;
+
+    assert_eq!(
+        lake.change("o", "UPDATE ov SET name = 'z' WHERE id = 1")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        lake.change("o", "DELETE FROM ov WHERE id = 3")
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        rows(lake.overlay("o", lake.head().await).await).await,
+        expected(&[(1, "z"), (2, "b")])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_write_that_read_a_stale_overlay_conflicts() {
+    let lake = Lake::start().await;
+    lake.write("t", &[1, 2], &["a", "b"]).await;
+    lake.create("o").await;
+    let stale = lake.writable_overlay("o").await;
+    lake.change("o", "DELETE FROM ov WHERE id = 1")
+        .await
+        .unwrap();
+    let before = lake.head().await;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("ov", Arc::new(stale)).unwrap();
+    let error = match ctx.sql("DELETE FROM ov WHERE id = 2").await {
+        Ok(frame) => frame.collect().await.expect_err("a stale write conflicts"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("changed after snapshot"),
+        "{error}"
+    );
+    assert_eq!(lake.head().await, before, "a conflict commits nothing");
+    assert_eq!(
+        rows(lake.overlay("o", before).await).await,
+        expected(&[(2, "b")])
+    );
 }

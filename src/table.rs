@@ -2811,6 +2811,17 @@ impl DuckLakeTable {
             ))
             .into());
         }
+        self.matching_file_rows(state, predicate).await
+    }
+
+    /// [`Self::matching_rows`] in the table's data files alone, whatever rows
+    /// it holds inline; [`Self::matching_inlined_row_ids`] finds those.
+    #[cfg(feature = "write")]
+    pub(crate) async fn matching_file_rows(
+        &self,
+        state: &dyn Session,
+        predicate: &Arc<dyn PhysicalExpr>,
+    ) -> DataFusionResult<Vec<MatchedRows>> {
         let inlined_deletes = self.inlined_deletes_by_file()?;
         let out_schema = rewrite_output_schema(&self.physical_schema);
         let mut matched = Vec::new();
@@ -2862,6 +2873,37 @@ impl DuckLakeTable {
             });
         }
         Ok(matched)
+    }
+
+    /// The row ids of the table's inlined rows that `predicate`, resolved
+    /// against [`Self::data_schema`], matches.
+    #[cfg(feature = "write")]
+    pub(crate) fn matching_inlined_row_ids(
+        &self,
+        predicate: &Arc<dyn PhysicalExpr>,
+    ) -> DataFusionResult<Vec<i64>> {
+        let mut row_ids = Vec::new();
+        for rows in self.inlined_data_with_row_ids()? {
+            let values = predicate
+                .evaluate(&rows.batch)?
+                .into_array(rows.batch.num_rows())?;
+            let values = values
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "a predicate did not evaluate to a boolean array".to_string(),
+                    )
+                })?;
+            row_ids.extend(
+                rows.row_ids
+                    .iter()
+                    .enumerate()
+                    .filter(|(row, _)| values.is_valid(*row) && values.value(*row))
+                    .map(|(_, row_id)| *row_id),
+            );
+        }
+        Ok(row_ids)
     }
 
     /// The table's data columns, without the synthetic `rowid`: what

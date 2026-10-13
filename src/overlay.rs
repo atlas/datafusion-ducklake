@@ -81,6 +81,23 @@ pub struct OverlayCommit {
     /// be an inlined row of the underlay visible at the base, and not hidden
     /// already.
     pub hide_inlined: Vec<i64>,
+    /// Overlay delete files that fold every position the overlay hides inline
+    /// in their data files; those inline positions end.
+    pub fold: Vec<OverlayFold>,
+}
+
+/// A new overlay delete file for one underlay data file, from a flush.
+#[derive(Debug, Clone)]
+pub struct OverlayFold {
+    /// The underlay data file it applies to.
+    pub data_file_id: i64,
+    /// The live overlay delete file it supersedes, or none. The commit
+    /// conflicts if the live one is another.
+    pub expected_prev_delete_file: Option<i64>,
+    /// Every deleted position of the data file: the underlay's deletes at the
+    /// base, the previous overlay delete file's and the folded ones.
+    pub file: DuckLakeFileData,
+    pub delete_count: i64,
 }
 
 /// A provider that answers for the underlay at its base with the overlay's
@@ -527,16 +544,29 @@ impl MetadataProvider for OverlayBaseProvider {
 /// and the overlay's own rows.
 #[derive(Debug)]
 pub struct DuckLakeOverlayTable {
+    base: Arc<OverlayBase>,
     underlay: Arc<DuckLakeTable>,
     overlay: Arc<DuckLakeTable>,
 }
 
 impl DuckLakeOverlayTable {
-    /// `underlay` must be built at the base snapshot over an
-    /// [`OverlayBaseProvider`], and `overlay` is the overlay's own table at the
-    /// snapshot being read. Both are read-only here and must have the same
+    /// `base` is the overlay as of the overlay table's snapshot, `underlay`
+    /// must be built at the base snapshot over an [`OverlayBaseProvider`] of
+    /// `base`, and `overlay` is the overlay's own table at that snapshot. Both are read-only here and must have the same
     /// columns, in the same order, with the same types and nullability.
-    pub fn try_new(underlay: Arc<DuckLakeTable>, overlay: Arc<DuckLakeTable>) -> Result<Self> {
+    pub fn try_new(
+        base: Arc<OverlayBase>,
+        underlay: Arc<DuckLakeTable>,
+        overlay: Arc<DuckLakeTable>,
+    ) -> Result<Self> {
+        if underlay.table_id() != base.underlay_table_id
+            || underlay.snapshot() != base.base_snapshot
+        {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "an overlay's underlay is table {} at snapshot {}",
+                base.underlay_table_id, base.base_snapshot
+            )));
+        }
         let (left, right) = (underlay.schema(), overlay.schema());
         let same = left.fields().len() == right.fields().len()
             && left.fields().iter().zip(right.fields()).all(|(a, b)| {
@@ -550,9 +580,15 @@ impl DuckLakeOverlayTable {
             ));
         }
         Ok(Self {
+            base,
             underlay,
             overlay,
         })
+    }
+
+    /// What the overlay hides, as of the overlay table's snapshot.
+    pub fn base(&self) -> &Arc<OverlayBase> {
+        &self.base
     }
 }
 
@@ -732,10 +768,119 @@ pub async fn create_overlay(
             create: Some((underlay.table_id(), underlay.snapshot())),
             hide: Vec::new(),
             hide_inlined: Vec::new(),
+            fold: Vec::new(),
         })
         .await?;
     let table = tables.first().ok_or_else(|| {
         DuckLakeError::Internal("an overlay's creation committed no table".to_string())
     })?;
     Ok((snapshot_id, table.table_id))
+}
+
+/// Flushes an overlay: the overlay table is flushed as any table is, its
+/// inlined rows written to Parquet and its inlined deletions of file rows
+/// merged into delete files; then every underlay data file the overlay hides
+/// rows of inline gets an overlay delete file holding all its deleted
+/// positions, superseding the previous one. Each step takes a snapshot of its
+/// own, and neither changes what the overlay reads. Returns the last snapshot,
+/// or `None` when there was nothing to flush.
+///
+/// `table` must be writable and read at the overlay's head; each commit
+/// conflicts if the overlay changed since. `underlay_schema` names the
+/// underlay's schema, under which the new delete files are written beside the
+/// underlay's own. Files written for a commit that fails are left for orphan
+/// cleanup, as an `UPDATE`'s are.
+#[cfg(feature = "write")]
+pub async fn flush_overlay(
+    table: &DuckLakeOverlayTable,
+    table_writer: &crate::table_writer::DuckLakeTableWriter,
+    underlay_schema: &str,
+    state: &dyn Session,
+) -> Result<Option<i64>> {
+    use std::collections::BTreeSet;
+
+    let overlay_schema = table.overlay.schema_name().ok_or_else(|| {
+        DuckLakeError::InvalidConfig("the overlay table is read-only".to_string())
+    })?;
+    let hidden_files = table
+        .base
+        .inlined_deletes
+        .iter()
+        .map(|delete| delete.data_file_id)
+        .collect::<BTreeSet<_>>();
+    let flushed = table_writer
+        .flush_table_inlined_data(
+            Arc::clone(table.overlay.provider()),
+            overlay_schema,
+            table.overlay.table_name(),
+            table.overlay.snapshot(),
+        )
+        .await?
+        .map(|flushed| flushed.snapshot_id);
+    if hidden_files.is_empty() {
+        return Ok(flushed);
+    }
+
+    let options = crate::table_writer::TableWriteOptions::new()
+        .with_expected_base_snapshot_id(flushed.unwrap_or(table.overlay.snapshot()));
+    let transaction = table_writer.transaction().with_options(&options);
+
+    let deleted_inline = table
+        .underlay
+        .inlined_deletes_by_file()
+        .map_err(|error| DuckLakeError::Internal(error.to_string()))?;
+    let mut fold = Vec::with_capacity(hidden_files.len());
+    for file in table.underlay.files()? {
+        if !hidden_files.contains(&file.data_file_id) {
+            continue;
+        }
+        let mut positions = match &file.delete_file {
+            Some(delete_file) => table
+                .underlay
+                .read_delete_file_positions(state, delete_file)
+                .await
+                .map_err(|error| DuckLakeError::Internal(error.to_string()))?,
+            None => Default::default(),
+        };
+        if let Some(inline) = deleted_inline.get(&file.data_file_id) {
+            positions.extend(inline);
+        }
+        let mut positions = positions.into_iter().collect::<Vec<_>>();
+        positions.sort_unstable();
+        let written = table_writer
+            .write_delete_file(
+                underlay_schema,
+                table.underlay.table_name(),
+                &file.file.path,
+                &positions,
+            )
+            .await?;
+        let mut data = DuckLakeFileData::new(
+            written.path,
+            written.path_is_relative,
+            written.file_size_bytes,
+        );
+        data.footer_size = written.footer_size;
+        fold.push(OverlayFold {
+            data_file_id: file.data_file_id,
+            expected_prev_delete_file: table
+                .base
+                .delete_files
+                .get(&file.data_file_id)
+                .map(|previous| previous.delete_file_id),
+            file: data,
+            delete_count: written.delete_count,
+        });
+    }
+
+    let (snapshot_id, _) = transaction
+        .commit_overlay(&OverlayCommit {
+            overlay_table_id: table.overlay.table_id(),
+            create: None,
+            hide: Vec::new(),
+            hide_inlined: Vec::new(),
+            fold,
+        })
+        .await?;
+    Ok(Some(snapshot_id))
 }

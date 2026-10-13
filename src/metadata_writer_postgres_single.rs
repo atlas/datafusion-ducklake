@@ -1532,6 +1532,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .await?;
             if !overlay.hide.is_empty()
                 || !overlay.hide_inlined.is_empty()
+                || !overlay.fold.is_empty()
                 || overlay.create.is_some()
             {
                 record_snapshot_changes(

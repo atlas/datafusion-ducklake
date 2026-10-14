@@ -452,6 +452,99 @@ async fn a_table_lock_holds_the_tables_other_writers_off() {
         .unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_login_that_may_only_change_rows_commits_to_a_lake() {
+    let (pool, container) = database().await.unwrap();
+    let data = TempDir::new().unwrap();
+    seed(&pool, &data).await;
+    // A login with the lake's rows and sequences, but no right to create anything.
+    sqlx::raw_sql(
+        "CREATE ROLE rows_only LOGIN PASSWORD 'rows_only';
+         GRANT USAGE ON SCHEMA lake TO rows_only;
+         GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA lake TO rows_only;
+         GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA lake TO rows_only;",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let rows_only = LakePool::connect(
+        &format!("postgresql://rows_only:rows_only@127.0.0.1:{port}/postgres"),
+        4,
+    )
+    .await
+    .unwrap();
+    let writer = Arc::new(PostgresSingleCatalogMetadataWriter::from_lake(
+        LakePool::in_schema(rows_only.clone(), LAKE),
+    ));
+    let catalog = DuckLakeCatalog::with_writer(
+        Arc::new(PostgresMetadataProvider::from_lake(LakePool::in_schema(
+            rows_only, LAKE,
+        ))),
+        writer.clone(),
+    )
+    .unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("lake", Arc::new(catalog));
+
+    assert_eq!(
+        affected(&ctx, "DELETE FROM lake.main.t WHERE id = 1").await,
+        1
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8View, true),
+        ])),
+        vec![Arc::new(Int64Array::from(vec![5])), Arc::new(StringViewArray::from(vec!["e"]))],
+    )
+    .unwrap();
+    let writer = DuckLakeTableWriter::new(writer, Arc::new(LocalFileSystem::new())).unwrap();
+    let mut transaction = writer.transaction();
+    transaction
+        .stage_write("main", "t", &batch.schema(), WriteMode::Append, &[batch])
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+    assert_eq!(
+        rows(&ctx, "SELECT id, name FROM lake.main.t ORDER BY id").await,
+        [(2, "b".into()), (3, "c".into()), (4, "d".into()), (5, "e".into())]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_lakes_data_path_is_none_until_it_is_created() {
+    let (pool, _container) = database().await.unwrap();
+    let lake = PostgresSingleCatalogMetadataWriter::from_lake(LakePool::in_schema(
+        pool.clone(),
+        "not_yet",
+    ));
+    assert_eq!(lake.data_path().await.unwrap(), None);
+    let lake = tokio::task::spawn_blocking(move || {
+        lake.initialize_schema().unwrap();
+        lake
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        lake.data_path().await.unwrap(),
+        None,
+        "created, but given no path"
+    );
+    let lake = tokio::task::spawn_blocking(move || {
+        lake.set_data_path("s3://bucket/lake/").unwrap();
+        lake
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        lake.data_path().await.unwrap().as_deref(),
+        Some("s3://bucket/lake/")
+    );
+}
+
 #[cfg(feature = "metadata-duckdb")]
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]

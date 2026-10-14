@@ -63,7 +63,10 @@
 //! connections, and a sqlx connection is only ever reported readable by that
 //! driver, so a catalog call through an adopted pool must not block the
 //! runtime the pool came from — under a `current_thread` runtime it blocks
-//! exactly that, and the call fails when the pool's acquire timeout expires.
+//! exactly that. The call fails when the pool's acquire timeout expires,
+//! answers when every reply it reads has already reached the socket, or hangs
+//! indefinitely when the pool's health check finds its reply waiting but the
+//! query does not: the acquire timeout does not bound the query.
 //! Those constructors say what they do and do not move.
 //!
 //! The cost is the threads this library starts without being asked, which is
@@ -114,6 +117,15 @@ pub mod compaction;
 #[cfg(feature = "write")]
 pub mod delete_exec;
 #[cfg(feature = "write")]
+pub mod inlined_flush;
+#[cfg(any(
+    feature = "write-sqlite",
+    feature = "write-duckdb",
+    feature = "write-mysql",
+    feature = "write-postgres"
+))]
+pub(crate) mod inlined_reclaim;
+#[cfg(feature = "write")]
 pub mod insert_exec;
 #[cfg(feature = "write")]
 pub mod maintenance;
@@ -153,8 +165,9 @@ pub type Result<T> = std::result::Result<T, DuckLakeError>;
 pub use catalog::DuckLakeCatalog;
 pub use error::{DuckLakeError, TypeChangeOperation, TypeChangeWriteMode};
 pub use metadata_provider::{
-    ColumnTag, DuckLakeFileData, DuckLakeTableFile, DuckLakeTag, MetadataProvider, ObjectTag,
-    SnapshotChangeMetadata, TagObjectType, TagTarget,
+    ColumnTag, DuckLakeFileData, DuckLakeInlinedFileDeleteForFlush, DuckLakeInlinedFlushData,
+    DuckLakeTableFile, DuckLakeTag, MetadataProvider, ObjectTag, SnapshotChangeMetadata,
+    TagObjectType, TagTarget,
 };
 pub use partition::{PartitionSpec, PartitionSpecColumn, PartitionTransform};
 pub use schema::DuckLakeSchema;
@@ -162,6 +175,8 @@ pub use snapshot_consistency::register_snapshot_consistency;
 pub use sort::{NullOrder, SortDirection, SortField, SortSpec};
 pub use table::DuckLakeTable;
 pub use table_functions::register_ducklake_functions;
+#[cfg(feature = "write")]
+pub use table_functions::register_ducklake_maintenance_functions;
 
 // Re-export metadata providers (feature-gated)
 #[cfg(feature = "metadata-duckdb")]
@@ -175,15 +190,18 @@ pub use metadata_provider_sqlite::SqliteMetadataProvider;
 
 // Re-export write types (feature-gated)
 #[cfg(feature = "write")]
-pub use compaction::{CompactionResult, MergeOptions, RewriteOptions};
+pub use compaction::{CheckpointResult, CompactionResult, MergeOptions, RewriteOptions};
 #[cfg(feature = "write")]
 pub use delete_exec::DuckLakeDeleteExec;
+#[cfg(feature = "write")]
+pub use inlined_flush::FlushedInlinedTable;
 #[cfg(feature = "write")]
 pub use insert_exec::DuckLakeInsertExec;
 #[cfg(feature = "write")]
 pub use metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile, DataFileInfo,
-    DeleteFileEntry, DeleteFileInfo, InlinedRowRef, MetadataWriter, MultiTableCommit,
+    DeleteFileEntry, DeleteFileInfo, InlinedFlushDeleteFile, InlinedFlushFile,
+    InlinedFlushFileDelete, InlinedFlushTable, InlinedRowRef, MetadataWriter, MultiTableCommit,
     PromoteLayout, PromotedFile, RowIdStart, SnapshotCommitMetadata, SourceRetirement,
     StagedTableData, StagedTableWrite, WriteMode, WriteResult, WriteSetupResult,
 };

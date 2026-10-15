@@ -1654,3 +1654,116 @@ async fn an_empty_inlined_registry_answers_up_to_the_head() {
         "never above the head"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Dropping a table
+// ---------------------------------------------------------------------------
+
+async fn count_rows(ctx: &SessionContext, table: &str) -> datafusion::error::Result<i64> {
+    let batches = ctx
+        .sql(&format!("SELECT count(*) FROM {table}"))
+        .await?
+        .collect()
+        .await?;
+    Ok(batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_dropped_table_is_gone_from_later_snapshots_only() {
+    let (writer, pool, conn_str, _tmp, _container) = setup().await.unwrap();
+    let tw = DuckLakeTableWriter::new(Arc::new(writer.clone()), object_store()).unwrap();
+    let written = tw
+        .write_table("main", "t", &[batch(vec![1, 2], vec![Some("a"), None])])
+        .await
+        .unwrap();
+    tw.write_table("main", "kept", &[batch(vec![1], vec![None])])
+        .await
+        .unwrap();
+
+    assert!(writer.drop_table("main", "t").await.unwrap());
+
+    let ctx = read_context(&conn_str).await;
+    assert!(count_rows(&ctx, "lake.main.t").await.is_err(), "dropped");
+    assert_eq!(count_rows(&ctx, "lake.main.kept").await.unwrap(), 1);
+    let provider = PostgresMetadataProvider::new(&conn_str).await.unwrap();
+    let before = DuckLakeCatalog::with_snapshot(Arc::new(provider), written.snapshot_id).unwrap();
+    let at = SessionContext::new();
+    at.register_catalog("lake", Arc::new(before));
+    assert_eq!(count_rows(&at, "lake.main.t").await.unwrap(), 2);
+
+    let dropped: i64 = sqlx::query_scalar("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let changes = changes_for(&pool, dropped).await.unwrap();
+    assert!(changes.starts_with("dropped_table:"), "{changes}");
+    let live_files: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ducklake_data_file f JOIN ducklake_table t USING (table_id)
+         WHERE t.table_name = 't' AND f.end_snapshot IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live_files, 0);
+
+    // Dropping it again changes nothing and takes no snapshot.
+    assert!(!writer.drop_table("main", "t").await.unwrap());
+    assert!(!writer.drop_table("main", "never").await.unwrap());
+    let latest: i64 = sqlx::query_scalar("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(latest, dropped);
+
+    // The name can be taken again, by a new, empty table.
+    tw.write_table("main", "t", &[batch(vec![9], vec![None])])
+        .await
+        .unwrap();
+    assert_eq!(
+        count_rows(&read_context(&conn_str).await, "lake.main.t")
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_write_staged_before_a_drop_is_refused() {
+    let (writer, _pool, conn_str, _tmp, _container) = setup().await.unwrap();
+    let tw = DuckLakeTableWriter::new(Arc::new(writer.clone()), object_store()).unwrap();
+    tw.write_table("main", "t", &[batch(vec![1], vec![None])])
+        .await
+        .unwrap();
+    let rows = batch(vec![2], vec![None]);
+    let mut transaction = tw.transaction();
+    transaction
+        .stage_write(
+            "main",
+            "t",
+            &rows.schema(),
+            WriteMode::Append,
+            std::slice::from_ref(&rows),
+        )
+        .await
+        .unwrap();
+
+    assert!(writer.drop_table("main", "t").await.unwrap());
+
+    let error = transaction.commit().await.unwrap_err();
+    assert!(
+        matches!(error, datafusion_ducklake::DuckLakeError::Conflict(_)),
+        "expected Conflict, got: {error}"
+    );
+    assert!(
+        count_rows(&read_context(&conn_str).await, "lake.main.t")
+            .await
+            .is_err()
+    );
+}

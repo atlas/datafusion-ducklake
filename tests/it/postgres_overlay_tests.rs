@@ -18,7 +18,7 @@ use testcontainers_modules::postgres::Postgres;
 use datafusion_ducklake::metadata_writer::MetadataWriter;
 use datafusion_ducklake::overlay::{
     DuckLakeOverlayTable, OverlayBase, OverlayBaseProvider, create_overlay, flush_overlay,
-    plan_rebase, rebase_overlay,
+    merge_overlay, plan_rebase, rebase_overlay,
 };
 use datafusion_ducklake::overlay_postgres::{initialize_overlay_schema, load_overlay_base};
 use datafusion_ducklake::{
@@ -374,6 +374,19 @@ impl Lake {
             &ctx.state(),
         )
         .await
+    }
+
+    /// Merges the overlay `o` as it is now.
+    async fn merge(&self) -> datafusion_ducklake::Result<i64> {
+        let table = self.writable_overlay("o").await;
+        merge_overlay(&table, &self.table_writer(self.writer().await)).await
+    }
+
+    /// `main.t` as a plain table reads it now.
+    async fn underlay_rows(&self) -> Vec<(i64, String)> {
+        let head = self.head().await;
+        let table = self.table_at(self.provider(), head, "t").await;
+        rows(DuckLakeTable::clone(&table)).await
     }
 
     async fn count(&self, sql: &str) -> i64 {
@@ -1011,4 +1024,227 @@ async fn a_rebase_after_a_flush_and_a_stale_plan() {
         rows(lake.overlay("o", rebased).await).await,
         expected(&[(1, "a"), (4, "d")])
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_merge_makes_the_overlays_changes_the_underlays_and_closes_it() {
+    let lake = Lake::start().await;
+    lake.write("t", &[1, 2, 3, 4], &["a", "b", "c", "d"]).await;
+    let (_, overlay) = lake.create("o").await;
+    let underlay = lake.table_id("t").await;
+    assert_eq!(
+        lake.count(&format!(
+            "SELECT COUNT(*) FROM lake.ducklake_column o JOIN lake.ducklake_column t
+               ON t.column_id = o.column_id AND t.column_name = o.column_name
+             WHERE o.table_id = {overlay} AND t.table_id = {underlay}"
+        ))
+        .await,
+        2,
+        "the overlay table's columns take the underlay's ids"
+    );
+    lake.change("o", "UPDATE ov SET name = 'B' WHERE id = 2")
+        .await
+        .unwrap();
+    lake.change("o", "DELETE FROM ov WHERE id = 3")
+        .await
+        .unwrap();
+    lake.change("o", "INSERT INTO ov VALUES (5, 'e'), (6, 'f')")
+        .await
+        .unwrap();
+    lake.flush().await.unwrap();
+    // Rows the overlay changes after flushing them live in its files' delete
+    // files, which the merge must carry.
+    lake.change("o", "DELETE FROM ov WHERE id = 6")
+        .await
+        .unwrap();
+    lake.change("o", "UPDATE ov SET name = 'E' WHERE id = 5")
+        .await
+        .unwrap();
+    lake.flush().await.unwrap();
+    let before = lake.head().await;
+    let merged_rows = expected(&[(1, "a"), (2, "B"), (4, "d"), (5, "E")]);
+    assert_eq!(rows(lake.overlay("o", before).await).await, merged_rows);
+
+    let merged = lake.merge().await.unwrap();
+
+    assert_eq!(lake.underlay_rows().await, merged_rows);
+    assert_eq!(
+        lake.count(&format!(
+            "SELECT COUNT(*) FROM lake.ducklake_overlay
+             WHERE overlay_table_id = {overlay} AND end_snapshot IS NULL"
+        ))
+        .await,
+        0,
+        "the overlay is closed"
+    );
+    assert_eq!(rows(lake.overlay("o", before).await).await, merged_rows);
+    let changes: String = sqlx::query_scalar(
+        "SELECT changes_made FROM lake.ducklake_snapshot_changes WHERE snapshot_id = $1",
+    )
+    .bind(merged)
+    .fetch_one(&lake.pool)
+    .await
+    .unwrap();
+    assert!(
+        changes.contains(&format!("inserted_into_table:{underlay}")),
+        "{changes}"
+    );
+    // The underlay goes on as any table: its merged rows can change.
+    lake.sql("UPDATE lake.main.t SET name = 'EE' WHERE id = 5")
+        .await;
+    lake.sql("DELETE FROM lake.main.t WHERE id = 2").await;
+    assert_eq!(
+        lake.underlay_rows().await,
+        expected(&[(1, "a"), (4, "d"), (5, "EE")])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn an_overlay_hides_its_underlays_inlined_rows_and_a_merge_ends_them() {
+    let lake = Lake::start().await;
+    lake.write("t", &[1], &["a"]).await;
+    // Small inserts stay in the catalog, as DuckLake inlines them.
+    lake.sql("INSERT INTO lake.main.t VALUES (2, 'b'), (3, 'c'), (4, 'd')")
+        .await;
+    let underlay = lake.table_id("t").await;
+    assert_eq!(
+        lake.count(&format!(
+            "SELECT COUNT(*) FROM lake.ducklake_data_file WHERE table_id = {underlay}"
+        ))
+        .await,
+        1,
+        "the later rows are inlined"
+    );
+    let (created, overlay) = lake.create("o").await;
+
+    lake.change("o", "UPDATE ov SET name = 'B' WHERE id = 2")
+        .await
+        .unwrap();
+    assert_eq!(
+        lake.change("o", "DELETE FROM ov WHERE id IN (1, 3)")
+            .await
+            .unwrap(),
+        2
+    );
+    let head = lake.head().await;
+    let changed = expected(&[(2, "B"), (4, "d")]);
+    assert_eq!(rows(lake.overlay("o", head).await).await, changed);
+    assert_eq!(
+        rows(lake.overlay("o", created).await).await,
+        expected(&[(1, "a"), (2, "b"), (3, "c"), (4, "d")]),
+        "the overlay as it was made hides nothing"
+    );
+    assert_eq!(
+        lake.underlay_rows().await,
+        expected(&[(1, "a"), (2, "b"), (3, "c"), (4, "d")]),
+        "the underlay is unchanged"
+    );
+    assert_eq!(
+        lake.count(&format!(
+            "SELECT COUNT(*) FROM lake.ducklake_overlay_inlined_row_delete
+             WHERE overlay_table_id = {overlay} AND end_snapshot IS NULL"
+        ))
+        .await,
+        2,
+        "the overlay hides two inlined rows by row id"
+    );
+    // A hidden row cannot be hidden again.
+    assert_eq!(
+        lake.change("o", "DELETE FROM ov WHERE id = 3")
+            .await
+            .unwrap(),
+        0
+    );
+
+    // A flush leaves hidden inlined rows inline; a merge ends them.
+    lake.flush().await.unwrap();
+    let merged = lake.merge().await.unwrap();
+    assert_eq!(lake.underlay_rows().await, changed);
+    let changes: String = sqlx::query_scalar(
+        "SELECT changes_made FROM lake.ducklake_snapshot_changes WHERE snapshot_id = $1",
+    )
+    .bind(merged)
+    .fetch_one(&lake.pool)
+    .await
+    .unwrap();
+    assert!(
+        changes.contains(&format!("inlined_delete:{underlay}")),
+        "{changes}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_merge_needs_a_flushed_overlay_at_the_underlays_head() {
+    let lake = Lake::start().await;
+    lake.write("t", &[1, 2], &["a", "b"]).await;
+    lake.create("o").await;
+    lake.change("o", "UPDATE ov SET name = 'B' WHERE id = 2")
+        .await
+        .unwrap();
+
+    let error = lake.merge().await.unwrap_err();
+    assert!(error.to_string().contains("flush"), "{error}");
+
+    lake.flush().await.unwrap();
+    lake.sql("INSERT INTO lake.main.t VALUES (3, 'c')").await;
+    let before = lake.head().await;
+    let error = lake.merge().await.unwrap_err();
+    assert!(
+        matches!(error, datafusion_ducklake::DuckLakeError::Conflict(_)),
+        "{error}"
+    );
+    assert_eq!(lake.head().await, before, "a refused merge commits nothing");
+
+    lake.rebase("o", &[]).await.unwrap();
+    lake.flush().await.unwrap();
+    lake.merge().await.unwrap();
+    assert_eq!(
+        lake.underlay_rows().await,
+        expected(&[(1, "a"), (2, "B"), (3, "c")])
+    );
+}
+
+#[cfg(feature = "metadata-duckdb")]
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn duckdb_reads_a_merged_underlay() {
+    let lake = Lake::start().await;
+    lake.write("t", &[1, 2, 3], &["a", "b", "c"]).await;
+    lake.create("o").await;
+    lake.change("o", "UPDATE ov SET name = 'B' WHERE id = 2")
+        .await
+        .unwrap();
+    lake.change("o", "DELETE FROM ov WHERE id = 3")
+        .await
+        .unwrap();
+    lake.change("o", "INSERT INTO ov VALUES (4, 'd')")
+        .await
+        .unwrap();
+    lake.flush().await.unwrap();
+    lake.merge().await.unwrap();
+
+    let port = lake._container.get_host_port_ipv4(5432).await.unwrap();
+    crate::common::ensure_ducklake_installed();
+    let duckdb = duckdb::Connection::open_in_memory().unwrap();
+    duckdb
+        .execute_batch("INSTALL postgres; LOAD postgres; LOAD ducklake;")
+        .unwrap();
+    let dsn = format!("host=127.0.0.1 port={port} dbname=postgres user=postgres password=postgres");
+    duckdb
+        .execute_batch(&format!(
+            "ATTACH 'ducklake:postgres:{dsn}' AS ours (METADATA_SCHEMA '{LAKE}', READ_ONLY)"
+        ))
+        .unwrap();
+    let mut read = duckdb
+        .prepare("SELECT id, name FROM ours.main.t ORDER BY id")
+        .unwrap();
+    let read: Vec<(i64, String)> = read
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(read, expected(&[(1, "a"), (2, "B"), (4, "d")]));
 }

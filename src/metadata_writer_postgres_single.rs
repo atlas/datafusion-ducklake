@@ -481,6 +481,104 @@ impl PostgresSingleCatalogMetadataWriter {
         .await
     }
 
+    /// Drop a live table at a new "drop snapshot", as DuckLake's `DROP TABLE` does.
+    ///
+    /// Sets `end_snapshot = <drop snapshot>` on the table's live rows in
+    /// `ducklake_table`, `ducklake_column`, `ducklake_column_tag`,
+    /// `ducklake_data_file`, `ducklake_delete_file`, `ducklake_partition_info`,
+    /// `ducklake_sort_info` and `ducklake_tag`, in one transaction. Reads at any
+    /// snapshot `>=` the drop snapshot no longer see the table; earlier snapshots
+    /// still do (time travel preserved). A write staged against the table before
+    /// the drop is refused at commit, since the commit checks its table is live.
+    /// The single-catalog mirror of
+    /// [`crate::multicatalog::MulticatalogManager::drop_table_in_catalog`] and the
+    /// SQLite writer's `drop_table`.
+    ///
+    /// Idempotent: returns `Ok(false)`, allocating no snapshot and taking no lock,
+    /// when no live `(schema, table)` pair exists. Data files are not removed: they stay
+    /// readable at earlier snapshots until expiry and cleanup reclaim them.
+    /// `ducklake_table_stats` is left in place, as by the SQLite writer, so
+    /// `next_row_id` stays monotonic; a table created again gets a new `table_id`.
+    ///
+    /// Run on the catalog runtime, like every other use of the pool. Only rows
+    /// change, so a login that may only change rows can drop a table.
+    pub async fn drop_table(&self, schema_name: &str, table_name: &str) -> Result<bool> {
+        validate_name(schema_name, "Schema")?;
+        validate_name(table_name, "Table")?;
+        let pool = self.pool.clone();
+        let schema_name = schema_name.to_string();
+        let table_name = table_name.to_string();
+        crate::metadata_provider::connect_on_catalog_runtime(async move {
+            const LIVE_TABLE: &str = "SELECT t.table_id FROM ducklake_table t
+                 JOIN ducklake_schema s ON s.schema_id = t.schema_id
+                 WHERE s.schema_name = $1 AND s.end_snapshot IS NULL
+                   AND t.table_name = $2 AND t.end_snapshot IS NULL";
+            // A table that is not there is a no-op, decided before taking the lock every
+            // commit to the lake waits for.
+            let live = sqlx::query_scalar::<_, i64>(LIVE_TABLE)
+                .bind(&schema_name)
+                .bind(&table_name)
+                .fetch_optional(&pool)
+                .await?;
+            if live.is_none() {
+                return Ok(false);
+            }
+            let mut tx = pool.begin().await?;
+            // The snapshot counter's row lock, as every commit takes it, so a commit to
+            // this table either lands before the drop or sees it dropped.
+            let (drop_snapshot, _schema_version) = insert_snapshot(&mut tx).await?;
+            // Read again under the lock: a drop that got there first makes this one a
+            // no-op, and returning drops `tx`, rolling back the snapshot allocated above.
+            let Some(table_id) = sqlx::query_scalar::<_, i64>(LIVE_TABLE)
+                .bind(&schema_name)
+                .bind(&table_name)
+                .fetch_optional(&mut *tx)
+                .await?
+            else {
+                return Ok(false);
+            };
+            // A drop is DDL. Like upstream `DropTables`, it records no
+            // `ducklake_schema_versions` row: the table has no live schema afterward.
+            bump_schema_version(&mut tx, drop_snapshot).await?;
+            for child in [
+                "ducklake_table",
+                "ducklake_column",
+                "ducklake_column_tag",
+                "ducklake_data_file",
+                "ducklake_delete_file",
+                "ducklake_partition_info",
+                "ducklake_sort_info",
+            ] {
+                sqlx::query(AssertSqlSafe(format!(
+                    "UPDATE {child} SET end_snapshot = $1
+                     WHERE table_id = $2 AND end_snapshot IS NULL"
+                )))
+                .bind(drop_snapshot)
+                .bind(table_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            sqlx::query(
+                "UPDATE ducklake_tag SET end_snapshot = $1
+                 WHERE object_id = $2 AND end_snapshot IS NULL",
+            )
+            .bind(drop_snapshot)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+            record_snapshot_changes(
+                &mut tx,
+                drop_snapshot,
+                &format!("dropped_table:{table_id}"),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(true)
+        })
+        .await
+    }
+
     /// Open a writer and create/upgrade the DuckLake catalog tables.
     pub async fn new_with_init(connection_string: &str) -> Result<Self> {
         let writer = Self::new(connection_string).await?;

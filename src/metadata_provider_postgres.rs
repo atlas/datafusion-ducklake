@@ -1462,13 +1462,18 @@ impl MetadataProvider for PostgresMetadataProvider {
         })
     }
 
-    fn find_snapshot_committed_with(&self, extra_info: &str) -> Result<Option<i64>> {
+    fn find_snapshot_committed_with(
+        &self,
+        extra_info: &str,
+        after: Option<i64>,
+    ) -> Result<Option<i64>> {
         block_on(async {
             let row = sqlx::query(
                 "SELECT MIN(snapshot_id) FROM ducklake_snapshot_changes
-                 WHERE commit_extra_info = $1",
+                 WHERE commit_extra_info = $1 AND ($2::BIGINT IS NULL OR snapshot_id > $2)",
             )
             .bind(extra_info)
+            .bind(after)
             .fetch_one(&self.pool)
             .await?;
             Ok(row.try_get::<Option<i64>, _>(0)?)

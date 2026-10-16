@@ -136,8 +136,12 @@ impl MetadataProvider for OverlayBaseProvider {
         self.inner.find_snapshot_by_commit_extra_info(needle)
     }
 
-    fn find_snapshot_committed_with(&self, extra_info: &str) -> Result<Option<i64>> {
-        self.inner.find_snapshot_committed_with(extra_info)
+    fn find_snapshot_committed_with(
+        &self,
+        extra_info: &str,
+        after: Option<i64>,
+    ) -> Result<Option<i64>> {
+        self.inner.find_snapshot_committed_with(extra_info, after)
     }
 
     fn get_table_head(&self, table_id: i64, snapshot_id: i64) -> Result<Option<i64>> {

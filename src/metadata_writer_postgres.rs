@@ -108,7 +108,7 @@ fn inlined_postgres_type(data_type: &DataType, ducklake_type: &str) -> String {
 
 // Nested values use reference DuckDB literal text so the shared parser and external readers
 // agree.
-fn postgres_type_inlines(data_type: &DataType) -> bool {
+pub(crate) fn postgres_type_inlines(data_type: &DataType) -> bool {
     crate::nested_inline::type_supports_inlining(data_type)
 }
 
@@ -1654,7 +1654,7 @@ pub(crate) async fn detect_new_inlined_deletes(
 /// untouched (multi-file safety). `ducklake_table_stats` is left as it is, as
 /// official's `DELETE` leaves it: `record_count` counts every row ever inserted,
 /// and `next_row_id` stays monotonic so rowids are never reused.
-async fn retire_prior_generation(
+pub(crate) async fn retire_prior_generation(
     table_id: i64,
     snapshot_id: i64,
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,

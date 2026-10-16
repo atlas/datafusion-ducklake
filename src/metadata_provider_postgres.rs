@@ -1188,6 +1188,19 @@ impl MetadataProvider for PostgresMetadataProvider {
         })
     }
 
+    fn find_snapshot_committed_with(&self, extra_info: &str) -> Result<Option<i64>> {
+        block_on(async {
+            let row = sqlx::query(
+                "SELECT MIN(snapshot_id) FROM ducklake_snapshot_changes
+                 WHERE commit_extra_info = $1",
+            )
+            .bind(extra_info)
+            .fetch_one(&self.pool)
+            .await?;
+            Ok(row.try_get::<Option<i64>, _>(0)?)
+        })
+    }
+
     fn get_table_head(&self, table_id: i64, snapshot_id: i64) -> Result<Option<i64>> {
         block_on(async {
             // Every catalog row of the table begins, and may end, at a snapshot that

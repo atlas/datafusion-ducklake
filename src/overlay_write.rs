@@ -274,6 +274,7 @@ impl OverlayStatement {
                 create: None,
                 hide,
                 hide_inlined,
+                fold: Vec::new(),
             })
             .await
             .map_err(external)?;

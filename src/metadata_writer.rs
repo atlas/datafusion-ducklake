@@ -3194,6 +3194,24 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         ))
     }
 
+    /// Commit staged table changes and an overlay's changes to what it hides
+    /// in its underlay (see [`crate::overlay`]) in one snapshot.
+    ///
+    /// `writes` may be empty when the write only hides underlay rows. With
+    /// `expected_base_snapshot_id`, the commit also conflicts if the overlay's
+    /// base or hidden rows changed after that snapshot.
+    fn commit_overlay(
+        &self,
+        _overlay: &crate::overlay::OverlayCommit,
+        _writes: &[StagedTableWrite],
+        _commit_metadata: &SnapshotCommitMetadata,
+        _expected_base_snapshot_id: Option<i64>,
+    ) -> Result<MultiTableCommit> {
+        Err(DuckLakeError::Unsupported(
+            "overlays are not supported by this metadata writer".to_string(),
+        ))
+    }
+
     /// Commit staged changes for multiple tables in one metadata transaction.
     ///
     /// Implementations allocate one snapshot, evaluate the optional table-state

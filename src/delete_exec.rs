@@ -305,7 +305,6 @@ async fn run_delete(
     let table_writer = DuckLakeTableWriter::new(Arc::clone(&writer), object_store)
         .map(|writer| writer.with_options(table.write_options()))
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-    let inlined_deletes = table.inlined_deletes_by_file()?;
 
     let predicate = match predicate {
         None => {
@@ -316,7 +315,7 @@ async fn run_delete(
                 inline_limit,
                 &table_files,
                 &inlined_data,
-                &inlined_deletes,
+                &table.inlined_deletes_by_file()?,
                 schema_name,
                 table_name,
                 base_snapshot,
@@ -326,12 +325,101 @@ async fn run_delete(
         Some(p) => p,
     };
 
+    let CollectedDeletes {
+        mut entries,
+        deletions,
+        inlined_rows,
+        count: total_deleted,
+    } = collect_deletes(
+        &table,
+        state,
+        &predicate,
+        &table_writer,
+        schema_name,
+        table_name,
+        &table_files,
+        &inlined_data,
+        capable.then_some(inline_limit),
+        base_snapshot,
+    )
+    .await?;
+
+    if !inlined_rows.is_empty() || deletions.needs_staged_commit() {
+        commit_row_deletes(
+            &table,
+            state,
+            &table_writer,
+            schema_name,
+            table_name,
+            base_snapshot,
+            deletions,
+            inlined_rows,
+        )
+        .await?;
+        return Ok(total_deleted);
+    }
+    entries.extend(deletions.positional);
+
+    if entries.is_empty() {
+        // Predicate matched nothing new anywhere: no commit, no snapshot.
+        return Ok(0);
+    }
+
+    // Commit every affected file's delete file in ONE snapshot (atomic
+    // multi-file DELETE). No new data file is appended, so this uses the
+    // dedicated delete-only commit rather than `register_data_file_with_deletes`
+    // (which requires an appended file).
+    if let Err(error) = writer.commit_deletes(
+        table_id,
+        schema_name,
+        table_name,
+        base_snapshot,
+        &entries,
+        &inlined_rows,
+    ) {
+        let error = table_writer
+            .release_written_delete_files(schema_name, table_name, error, &entries)
+            .await;
+        return Err(DataFusionError::External(Box::new(error)));
+    }
+
+    Ok(total_deleted)
+}
+
+/// What a `DELETE` removes from one table: the inlined rows it ends and, per
+/// data file it touches, its deletions as [`FileDeletions::record`] records
+/// them, or, on a writer without staged row mutations, a cumulative delete
+/// file (already written).
+pub(crate) struct CollectedDeletes {
+    pub(crate) entries: Vec<DeleteFileEntry>,
+    pub(crate) deletions: FileDeletions,
+    pub(crate) inlined_rows: Vec<InlinedRowRef>,
+    pub(crate) count: u64,
+}
+
+/// The rows of `table_files` and `inlined_data` that `predicate` matches and
+/// that are not deleted already. `staged` is the inlining limit of a writer
+/// that stages row mutations, or `None` to write cumulative delete files.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn collect_deletes(
+    table: &DuckLakeTable,
+    state: &dyn Session,
+    predicate: &Arc<dyn PhysicalExpr>,
+    table_writer: &DuckLakeTableWriter,
+    schema_name: &str,
+    table_name: &str,
+    table_files: &[crate::metadata_provider::DuckLakeTableFile],
+    inlined_data: &[crate::metadata_provider::DuckLakeInlinedData],
+    staged: Option<usize>,
+    base_snapshot: i64,
+) -> DataFusionResult<CollectedDeletes> {
+    let inlined_deletes = table.inlined_deletes_by_file()?;
     let mut entries: Vec<DeleteFileEntry> = Vec::new();
     let mut deletions = FileDeletions::default();
     let mut inlined_rows: Vec<InlinedRowRef> = Vec::new();
     let mut total_deleted: u64 = 0;
 
-    for inlined in &inlined_data {
+    for inlined in inlined_data {
         let values = predicate.evaluate(&inlined.batch)?;
         let matches = values.into_array(inlined.batch.num_rows())?;
         let matches = matches
@@ -353,7 +441,7 @@ async fn run_delete(
     }
     total_deleted += inlined_rows.len() as u64;
 
-    for tf in &table_files {
+    for tf in table_files {
         // A file rewritten by an UPDATE or by compaction is handled here like any
         // other. A delete file's `pos` is a row's physical index in the data file,
         // and a rewrite leaves that meaningful — the rewritten rows sit at
@@ -364,7 +452,7 @@ async fn run_delete(
         // Physical positions matching the predicate (raw scan; delete files NOT
         // applied — resolution is over the file's own rows).
         let matched = table
-            .resolve_positions(state, &tf.file, Arc::clone(&predicate))
+            .resolve_positions(state, &tf.file, Arc::clone(predicate))
             .await?;
         if matched.is_empty() {
             continue;
@@ -391,11 +479,11 @@ async fn run_delete(
         newly_deleted.sort_unstable();
         total_deleted += newly_deleted.len() as u64;
 
-        if capable {
+        if let Some(inline_limit) = staged {
             deletions
                 .record(
-                    &table,
-                    &table_writer,
+                    table,
+                    table_writer,
                     schema_name,
                     table_name,
                     &DeletionTarget::of_file(tf, &existing),
@@ -424,46 +512,12 @@ async fn run_delete(
         });
     }
 
-    if capable && (!inlined_rows.is_empty() || deletions.needs_staged_commit()) {
-        commit_row_deletes(
-            &table,
-            state,
-            &table_writer,
-            schema_name,
-            table_name,
-            base_snapshot,
-            deletions,
-            inlined_rows,
-        )
-        .await?;
-        return Ok(total_deleted);
-    }
-    entries.extend(deletions.positional);
-
-    if entries.is_empty() && inlined_rows.is_empty() {
-        // Predicate matched nothing new anywhere: no commit, no snapshot.
-        return Ok(0);
-    }
-
-    // Commit every affected file's delete file in ONE snapshot (atomic
-    // multi-file DELETE). No new data file is appended, so this uses the
-    // dedicated delete-only commit rather than `register_data_file_with_deletes`
-    // (which requires an appended file).
-    if let Err(error) = writer.commit_deletes(
-        table_id,
-        schema_name,
-        table_name,
-        base_snapshot,
-        &entries,
-        &inlined_rows,
-    ) {
-        let error = table_writer
-            .release_written_delete_files(schema_name, table_name, error, &entries)
-            .await;
-        return Err(DataFusionError::External(Box::new(error)));
-    }
-
-    Ok(total_deleted)
+    Ok(CollectedDeletes {
+        entries,
+        deletions,
+        inlined_rows,
+        count: total_deleted,
+    })
 }
 
 /// A live data file a statement deletes rows from.

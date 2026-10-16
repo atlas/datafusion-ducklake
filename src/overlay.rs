@@ -8,6 +8,8 @@
 //!
 //! - positions in underlay data files, laid out as DuckLake's inlined
 //!   deletions (`data_file_id`, `row_id`);
+//! - the underlay's inlined rows it hides, by row id, as DuckLake ends an
+//!   inlined row by its row id;
 //! - per underlay data file, at most one overlay delete file. It holds the
 //!   underlay's own deletes at the base as well as the overlay's, so it takes
 //!   the place of the underlay's delete file for that data file.
@@ -56,8 +58,29 @@ pub struct OverlayBase {
     pub base_snapshot: i64,
     /// Positions hidden in underlay data files, beyond the overlay delete files.
     pub inlined_deletes: Vec<DuckLakeInlinedDelete>,
+    /// Row ids of the underlay's inlined rows the overlay hides.
+    pub inlined_row_deletes: std::collections::HashSet<i64>,
     /// Overlay delete files, by the underlay data file they apply to.
     pub delete_files: HashMap<i64, OverlayDeleteFile>,
+}
+
+/// What one overlay write changes in what the overlay hides, committed with the
+/// overlay table's own changes in one snapshot by
+/// [`MetadataWriter::commit_overlay`](crate::metadata_writer::MetadataWriter::commit_overlay).
+#[derive(Debug, Clone, Default)]
+pub struct OverlayCommit {
+    /// The overlay's table: a staged write's table id, or a committed table's.
+    pub overlay_table_id: i64,
+    /// Make the table an overlay of `(underlay_table_id, base_snapshot)` in
+    /// this snapshot. The table must not be an overlay already.
+    pub create: Option<(i64, i64)>,
+    /// Underlay positions the overlay starts to hide. Each must be in an
+    /// underlay data file live at the base, and not hidden already.
+    pub hide: Vec<DuckLakeInlinedDelete>,
+    /// Row ids of underlay inlined rows the overlay starts to hide. Each must
+    /// be an inlined row of the underlay visible at the base, and not hidden
+    /// already.
+    pub hide_inlined: Vec<i64>,
 }
 
 /// A provider that answers for the underlay at its base with the overlay's
@@ -92,6 +115,38 @@ impl OverlayBaseProvider {
         Ok(true)
     }
 
+    /// Whether a read of `table_id`'s inlined rows at `snapshot_id` must leave
+    /// out rows the overlay hides.
+    fn hides_inlined_rows(&self, table_id: i64, snapshot_id: i64) -> Result<bool> {
+        Ok(self.applies(table_id, snapshot_id)? && !self.base.inlined_row_deletes.is_empty())
+    }
+
+    /// Which of `row_ids` the overlay does not hide.
+    fn unhidden(&self, row_ids: &[i64]) -> arrow::array::BooleanArray {
+        row_ids
+            .iter()
+            .map(|row_id| Some(!self.base.inlined_row_deletes.contains(row_id)))
+            .collect()
+    }
+
+    /// The underlay's inlined rows visible at the base that the overlay does
+    /// not hide, read as a scan reads them.
+    fn visible_inlined_rows(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &[DuckLakeTableColumn],
+        filter: Option<&InlinedFilter>,
+    ) -> Result<Vec<arrow::record_batch::RecordBatch>> {
+        self.read_inlined_rows(
+            table_id,
+            columns,
+            crate::metadata_provider::InlinedRowSelection::VisibleAt(snapshot_id),
+            filter,
+        )
+        .map(|rows| rows.into_iter().map(|rows| rows.batch).collect())
+    }
+
     fn replace_delete_file(&self, file: &mut DuckLakeTableFile) {
         if let Some(overlay) = self.base.delete_files.get(&file.data_file_id) {
             file.delete_file_id = Some(overlay.delete_file_id);
@@ -99,6 +154,16 @@ impl OverlayBaseProvider {
             file.delete_count = Some(overlay.delete_count);
         }
     }
+}
+
+/// The values of `values` that `keep` keeps.
+fn kept<T: Clone>(values: &[T], keep: &arrow::array::BooleanArray) -> Vec<T> {
+    values
+        .iter()
+        .zip(keep.iter())
+        .filter(|(_, keep)| keep.unwrap_or(false))
+        .map(|(value, _)| value.clone())
+        .collect()
 }
 
 /// The underlay with an overlay's deletes is never the catalog's current table
@@ -261,7 +326,10 @@ impl MetadataProvider for OverlayBaseProvider {
         snapshot_id: i64,
         columns: &[DuckLakeTableColumn],
     ) -> Result<Vec<arrow::record_batch::RecordBatch>> {
-        self.inner.get_inlined_data(table_id, snapshot_id, columns)
+        if !self.hides_inlined_rows(table_id, snapshot_id)? {
+            return self.inner.get_inlined_data(table_id, snapshot_id, columns);
+        }
+        self.visible_inlined_rows(table_id, snapshot_id, columns, None)
     }
 
     fn scan_inlined_data(
@@ -271,8 +339,17 @@ impl MetadataProvider for OverlayBaseProvider {
         columns: &[DuckLakeTableColumn],
         filter: Option<&InlinedFilter>,
     ) -> Result<InlinedDataScan> {
-        self.inner
-            .scan_inlined_data(table_id, snapshot_id, columns, filter)
+        if !self.hides_inlined_rows(table_id, snapshot_id)? {
+            return self
+                .inner
+                .scan_inlined_data(table_id, snapshot_id, columns, filter);
+        }
+        Ok(InlinedDataScan::from_batches(self.visible_inlined_rows(
+            table_id,
+            snapshot_id,
+            columns,
+            filter,
+        )?))
     }
 
     fn get_inlined_deletes(
@@ -293,8 +370,56 @@ impl MetadataProvider for OverlayBaseProvider {
         snapshot_id: i64,
         columns: &[DuckLakeTableColumn],
     ) -> Result<Vec<DuckLakeInlinedData>> {
-        self.inner
-            .get_inlined_data_with_row_ids(table_id, snapshot_id, columns)
+        let data = self
+            .inner
+            .get_inlined_data_with_row_ids(table_id, snapshot_id, columns)?;
+        if !self.hides_inlined_rows(table_id, snapshot_id)? {
+            return Ok(data);
+        }
+        data.into_iter()
+            .map(|data| {
+                let keep = self.unhidden(&data.row_ids);
+                Ok(DuckLakeInlinedData {
+                    row_ids: kept(&data.row_ids, &keep),
+                    begin_snapshots: kept(&data.begin_snapshots, &keep),
+                    batch: arrow::compute::filter_record_batch(&data.batch, &keep)?,
+                    table_name: data.table_name,
+                })
+            })
+            .collect()
+    }
+
+    fn read_inlined_rows(
+        &self,
+        table_id: i64,
+        columns: &[DuckLakeTableColumn],
+        selection: crate::metadata_provider::InlinedRowSelection,
+        filter: Option<&InlinedFilter>,
+    ) -> Result<Vec<crate::metadata_provider::DuckLakeInlinedRows>> {
+        let hides = match selection {
+            crate::metadata_provider::InlinedRowSelection::VisibleAt(snapshot_id) => {
+                self.hides_inlined_rows(table_id, snapshot_id)?
+            },
+            _ => false,
+        };
+        let rows = self
+            .inner
+            .read_inlined_rows(table_id, columns, selection, filter)?;
+        if !hides {
+            return Ok(rows);
+        }
+        rows.into_iter()
+            .map(|rows| {
+                let keep = self.unhidden(&rows.row_ids);
+                Ok(crate::metadata_provider::DuckLakeInlinedRows {
+                    row_ids: kept(&rows.row_ids, &keep),
+                    snapshots: kept(&rows.snapshots, &keep),
+                    end_snapshots: kept(&rows.end_snapshots, &keep),
+                    batch: arrow::compute::filter_record_batch(&rows.batch, &keep)?,
+                    table_name: rows.table_name,
+                })
+            })
+            .collect()
     }
 
     fn get_table_row_count(&self, table_id: i64, snapshot_id: i64) -> Result<u64> {
@@ -466,4 +591,143 @@ impl TableProvider for DuckLakeOverlayTable {
         }
         UnionExec::try_new(vec![underlay, overlay])
     }
+
+    /// Adds the rows to the overlay table.
+    #[cfg(feature = "write")]
+    async fn insert_into(
+        &self,
+        state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: datafusion::logical_expr::dml::InsertOp,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        if insert_op != datafusion::logical_expr::dml::InsertOp::Append {
+            return Err(DataFusionError::NotImplemented(
+                "an overlay only takes appending inserts".to_string(),
+            ));
+        }
+        self.overlay.insert_into(state, input, insert_op).await
+    }
+
+    /// Hides matching underlay rows and deletes matching overlay rows.
+    #[cfg(feature = "write")]
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.statement(
+            state,
+            filters,
+            Vec::new(),
+            crate::overlay_write::StatementKind::Delete,
+        )
+    }
+
+    /// Hides matching underlay rows and writes their new versions to the
+    /// overlay table, and updates matching overlay rows.
+    #[cfg(feature = "write")]
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.statement(
+            state,
+            filters,
+            assignments,
+            crate::overlay_write::StatementKind::Update,
+        )
+    }
+}
+
+#[cfg(feature = "write")]
+impl DuckLakeOverlayTable {
+    /// Plans a `DELETE` or `UPDATE`; [`crate::overlay_write`] runs it.
+    fn statement(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+        assignments: Vec<(String, Expr)>,
+        kind: crate::overlay_write::StatementKind,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        use datafusion::common::DFSchema;
+        use datafusion::logical_expr::utils::conjunction;
+
+        let writer = self.overlay.writer().cloned().ok_or_else(|| {
+            DataFusionError::Plan(
+                "the overlay table is read-only; open it with a writer".to_string(),
+            )
+        })?;
+        let schema_name = self
+            .overlay
+            .schema_name()
+            .map(str::to_string)
+            .ok_or_else(|| {
+                DataFusionError::Internal("schema name not set for a writable table".to_string())
+            })?;
+        let physical_schema = self.overlay.physical_schema();
+        let df_schema = DFSchema::try_from(physical_schema.as_ref().clone())?;
+        let predicate = conjunction(filters)
+            .map(|expr| state.create_physical_expr(expr, &df_schema))
+            .transpose()?;
+        let assignments = assignments
+            .into_iter()
+            .map(|(column, expr)| {
+                let index = physical_schema.index_of(&column).map_err(|_| {
+                    DataFusionError::Plan(format!(
+                        "UPDATE assignment targets unknown column '{column}'"
+                    ))
+                })?;
+                Ok((index, state.create_physical_expr(expr, &df_schema)?))
+            })
+            .collect::<DataFusionResult<Vec<_>>>()?;
+        let session_state = state
+            .as_any()
+            .downcast_ref::<datafusion::execution::SessionState>()
+            .ok_or_else(|| {
+                DataFusionError::Internal("an overlay write needs a SessionState".to_string())
+            })?
+            .clone();
+        Ok(Arc::new(crate::overlay_write::OverlayWriteExec::new(
+            crate::overlay_write::OverlayStatement {
+                underlay: Arc::clone(&self.underlay),
+                overlay: Arc::clone(&self.overlay),
+                overlay_table_id: self.overlay.table_id(),
+                writer,
+                schema_name,
+                predicate,
+                assignments,
+                kind,
+            },
+            session_state,
+        )))
+    }
+}
+
+/// Creates `schema_name.table_name` with `underlay`'s columns and makes it an
+/// overlay of `underlay` at the snapshot `underlay` was read at, in one
+/// snapshot. Returns that snapshot and the overlay table's id.
+#[cfg(feature = "write")]
+pub async fn create_overlay(
+    table_writer: &crate::table_writer::DuckLakeTableWriter,
+    schema_name: &str,
+    table_name: &str,
+    underlay: &DuckLakeTable,
+) -> Result<(i64, i64)> {
+    let mut transaction = table_writer.transaction();
+    let staged =
+        transaction.stage_table(schema_name, table_name, underlay.data_schema().as_ref())?;
+    let (snapshot_id, tables) = transaction
+        .commit_overlay(&OverlayCommit {
+            overlay_table_id: staged,
+            create: Some((underlay.table_id(), underlay.snapshot())),
+            hide: Vec::new(),
+            hide_inlined: Vec::new(),
+        })
+        .await?;
+    let table = tables.first().ok_or_else(|| {
+        DuckLakeError::Internal("an overlay's creation committed no table".to_string())
+    })?;
+    Ok((snapshot_id, table.table_id))
 }

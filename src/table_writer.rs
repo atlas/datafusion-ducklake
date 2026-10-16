@@ -3190,6 +3190,52 @@ impl DuckLakeWriteTransaction<'_> {
         Ok(())
     }
 
+    /// Stages `table_name` with `arrow_schema`'s columns and no rows: the
+    /// commit creates the table, or alters an existing one to those columns.
+    /// Returns the table id the commit maps to the committed one.
+    pub fn stage_table(
+        &mut self,
+        schema_name: &str,
+        table_name: &str,
+        arrow_schema: &Schema,
+    ) -> Result<i64> {
+        let validation_schema =
+            self.writer
+                .validation_schema(schema_name, table_name, arrow_schema)?;
+        let columns = arrow_schema_to_column_defs(&validation_schema)?;
+        let setup = self.writer.metadata.begin_write_transaction(
+            schema_name,
+            table_name,
+            &columns,
+            WriteMode::Append,
+        )?;
+        self.writes.push(PreparedTableWrite {
+            write: StagedTableWrite {
+                table_id: setup.table_id,
+                schema_name: schema_name.to_string(),
+                table_name: table_name.to_string(),
+                base_snapshot_id: setup.base_snapshot_id,
+                mode: WriteMode::Append,
+                columns,
+                column_ids: setup.field_ids,
+                data: StagedTableData::None,
+                snapshot_id_columns: Vec::new(),
+                positional_deletes: Vec::new(),
+                inlined_deletes: Vec::new(),
+                inlined_row_ids: None,
+                inlined_file_deletes: Vec::new(),
+                rewritten_deletes: Vec::new(),
+                dropped_files: Vec::new(),
+                inlined_flush: false,
+            },
+            object_paths: Vec::new(),
+            files_written: 0,
+            records_written: 0,
+            rewrite_sources: Vec::new(),
+        });
+        Ok(setup.table_id)
+    }
+
     /// Commits every staged table change in one metadata transaction.
     ///
     /// A `DELETE` or `UPDATE` that rewrites a delete file dates its deletions
@@ -3209,6 +3255,30 @@ impl DuckLakeWriteTransaction<'_> {
         if self.writes.is_empty() {
             return Ok(Vec::new());
         }
+        let committed = self.commit_staged(None).await?;
+        self.results(committed)
+    }
+
+    /// Commits the staged writes together with `overlay`'s changes to what it
+    /// hides in its underlay, in one snapshot (see [`crate::overlay`]), retried
+    /// as [`Self::commit`] retries. Unlike [`Self::commit`], nothing need be
+    /// staged: a write may only hide rows. Returns the snapshot and the staged
+    /// tables' results.
+    pub async fn commit_overlay(
+        mut self,
+        overlay: &crate::overlay::OverlayCommit,
+    ) -> Result<(i64, Vec<WriteResult>)> {
+        let committed = self.commit_staged(Some(overlay)).await?;
+        let snapshot_id = committed.snapshot_id;
+        Ok((snapshot_id, self.results(committed)?))
+    }
+
+    /// Commits the staged writes, with `overlay`'s changes when given, retrying
+    /// and cleaning up as [`Self::commit`] describes.
+    async fn commit_staged(
+        &mut self,
+        overlay: Option<&crate::overlay::OverlayCommit>,
+    ) -> Result<crate::metadata_writer::MultiTableCommit> {
         let mut attempt = 0;
         let committed = loop {
             let writes = self
@@ -3216,12 +3286,18 @@ impl DuckLakeWriteTransaction<'_> {
                 .iter()
                 .map(|prepared| prepared.write.clone())
                 .collect::<Vec<_>>();
-            let committed = self.writer.with_inlining_limit(|| {
-                self.writer.metadata.commit_multi_table(
+            let committed = self.writer.with_inlining_limit(|| match overlay {
+                Some(overlay) => self.writer.metadata.commit_overlay(
+                    overlay,
                     &writes,
                     &self.commit_metadata,
                     self.expected_base_snapshot_id,
-                )
+                ),
+                None => self.writer.metadata.commit_multi_table(
+                    &writes,
+                    &self.commit_metadata,
+                    self.expected_base_snapshot_id,
+                ),
             });
             let e = match committed {
                 Ok(committed) => break committed,
@@ -3276,6 +3352,14 @@ impl DuckLakeWriteTransaction<'_> {
             }
             return Err(e);
         };
+        Ok(committed)
+    }
+
+    /// Each staged table's result in `committed`.
+    fn results(
+        &self,
+        committed: crate::metadata_writer::MultiTableCommit,
+    ) -> Result<Vec<WriteResult>> {
         if committed.tables.len() != self.writes.len() {
             return Err(crate::error::DuckLakeError::Internal(format!(
                 "multi-table commit returned {} table ids for {} stages",

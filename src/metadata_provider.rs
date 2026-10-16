@@ -1646,14 +1646,21 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         ))
     }
 
-    /// The first snapshot committed with `commit_extra_info` exactly `extra_info`, whatever
-    /// it changed and whatever later snapshots did to its files: one that only deleted
-    /// rows, or whose files a later snapshot ended, is found too. `None` when no snapshot
-    /// was.
+    /// The first snapshot after `after` (every snapshot when `None`) committed with
+    /// `commit_extra_info` exactly `extra_info`, whatever it changed and whatever later
+    /// snapshots did to its files: one that only deleted rows, or whose files a later
+    /// snapshot ended, is found too. `None` when no such snapshot was.
     ///
-    /// It reads every snapshot's change row, so it suits finding out whether a commit
-    /// whose outcome was lost happened, not a lookup on every write.
-    fn find_snapshot_committed_with(&self, _extra_info: &str) -> Result<Option<i64>> {
+    /// Snapshot IDs are taken in commit order, so a caller that noted a snapshot and
+    /// looks after it finds every such commit it could not have seen then. Looking after a
+    /// recent snapshot reads only the change rows since; looking at every snapshot reads
+    /// them all, which suits finding out whether a commit whose outcome was lost happened,
+    /// not a lookup on every write.
+    fn find_snapshot_committed_with(
+        &self,
+        _extra_info: &str,
+        _after: Option<i64>,
+    ) -> Result<Option<i64>> {
         Err(DuckLakeError::Unsupported(
             "finding a commit by its metadata is not supported by this backend".to_string(),
         ))

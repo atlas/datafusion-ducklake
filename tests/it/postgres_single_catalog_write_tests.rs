@@ -1809,7 +1809,7 @@ async fn a_tables_head_moves_with_its_own_changes_only() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-async fn a_commit_is_found_by_its_metadata_after_its_files_are_ended() {
+async fn a_commit_is_found_by_its_metadata_after_its_files_are_ended_and_after_a_snapshot() {
     use datafusion_ducklake::{SnapshotCommitMetadata, TableWriteOptions};
 
     let (writer, _pool, conn_str, _tmp, _container) = setup().await.unwrap();
@@ -1840,7 +1840,9 @@ async fn a_commit_is_found_by_its_metadata_after_its_files_are_ended() {
     let first = commit("command:1", WriteMode::Append).await;
     let provider = PostgresMetadataProvider::new(&conn_str).await.unwrap();
     assert_eq!(
-        provider.find_snapshot_committed_with("command:1").unwrap(),
+        provider
+            .find_snapshot_committed_with("command:1", None)
+            .unwrap(),
         Some(first)
     );
 
@@ -1855,19 +1857,36 @@ async fn a_commit_is_found_by_its_metadata_after_its_files_are_ended() {
         None
     );
     assert_eq!(
-        provider.find_snapshot_committed_with("command:1").unwrap(),
+        provider
+            .find_snapshot_committed_with("command:1", None)
+            .unwrap(),
         Some(first)
     );
     assert_eq!(
-        provider.find_snapshot_committed_with("command:2").unwrap(),
+        provider
+            .find_snapshot_committed_with("command:2", None)
+            .unwrap(),
         Some(second)
     );
     assert_eq!(
-        provider.find_snapshot_committed_with("command:").unwrap(),
+        provider
+            .find_snapshot_committed_with("command:", None)
+            .unwrap(),
         None
     );
     assert_eq!(
-        provider.find_snapshot_committed_with("command:3").unwrap(),
+        provider
+            .find_snapshot_committed_with("command:3", None)
+            .unwrap(),
         None
     );
+    // After a snapshot, only commits since count.
+    let after = |info: &str, snapshot: i64| {
+        provider
+            .find_snapshot_committed_with(info, Some(snapshot))
+            .unwrap()
+    };
+    assert_eq!(after("command:1", first), None);
+    assert_eq!(after("command:1", first - 1), Some(first));
+    assert_eq!(after("command:2", first), Some(second));
 }

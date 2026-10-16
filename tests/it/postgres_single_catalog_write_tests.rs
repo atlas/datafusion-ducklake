@@ -1837,3 +1837,68 @@ async fn a_tables_head_moves_with_its_own_changes_only() {
         Some(appended)
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_commit_is_found_by_its_metadata_after_its_files_are_ended() {
+    use datafusion_ducklake::{SnapshotCommitMetadata, TableWriteOptions};
+
+    let (writer, _pool, conn_str, _tmp, _container) = setup().await.unwrap();
+    let tw = DuckLakeTableWriter::new(Arc::new(writer.clone()), object_store()).unwrap();
+    tw.write_table("main", "t", &[batch(vec![1], vec![Some("a")])])
+        .await
+        .unwrap();
+    let commit = |info: &str, mode: WriteMode| {
+        let tw = &tw;
+        let options = TableWriteOptions::new()
+            .with_commit_metadata(SnapshotCommitMetadata::new().with_extra_info(info));
+        async move {
+            let rows = batch(vec![2], vec![None]);
+            let mut transaction = tw.transaction().with_options(&options);
+            transaction
+                .stage_write(
+                    "main",
+                    "t",
+                    &rows.schema(),
+                    mode,
+                    std::slice::from_ref(&rows),
+                )
+                .await
+                .unwrap();
+            transaction.commit().await.unwrap()[0].snapshot_id
+        }
+    };
+    let first = commit("command:1", WriteMode::Append).await;
+    let provider = PostgresMetadataProvider::new(&conn_str).await.unwrap();
+    assert_eq!(
+        provider.find_snapshot_committed_with("command:1").unwrap(),
+        Some(first)
+    );
+
+    // A later snapshot replacing the table ends the files the first wrote. The lookup
+    // for live files no longer finds it; this one still does, by the whole value only.
+    let second = commit("command:2", WriteMode::Replace).await;
+    assert!(second > first);
+    assert_eq!(
+        provider
+            .find_snapshot_by_commit_extra_info("command:1")
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        provider.find_snapshot_committed_with("command:1").unwrap(),
+        Some(first)
+    );
+    assert_eq!(
+        provider.find_snapshot_committed_with("command:2").unwrap(),
+        Some(second)
+    );
+    assert_eq!(
+        provider.find_snapshot_committed_with("command:").unwrap(),
+        None
+    );
+    assert_eq!(
+        provider.find_snapshot_committed_with("command:3").unwrap(),
+        None
+    );
+}

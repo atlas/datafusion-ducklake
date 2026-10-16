@@ -2267,6 +2267,19 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         ))
     }
 
+    /// The first snapshot committed with `commit_extra_info` exactly `extra_info`, whatever
+    /// it changed and whatever later snapshots did to its files: one that only deleted
+    /// rows, or whose files a later snapshot ended, is found too. `None` when no snapshot
+    /// was.
+    ///
+    /// It reads every snapshot's change row, so it suits finding out whether a commit
+    /// whose outcome was lost happened, not a lookup on every write.
+    fn find_snapshot_committed_with(&self, _extra_info: &str) -> Result<Option<i64>> {
+        Err(DuckLakeError::Unsupported(
+            "finding a commit by its metadata is not supported by this backend".to_string(),
+        ))
+    }
+
     /// The latest snapshot, up to `snapshot_id`, that changed table `table_id`: the one
     /// that created it, changed its columns, or added or removed data or delete files.
     /// `None` when the table does not exist at `snapshot_id`.

@@ -63,15 +63,36 @@ CREATE UNIQUE INDEX IF NOT EXISTS ducklake_overlay_delete_file_live
 
 /// Creates the overlay tables in `pool`'s lake.
 pub async fn initialize_overlay_schema(pool: &LakePool) -> Result<()> {
-    sqlx::raw_sql(SQL_CREATE_OVERLAY_TABLES)
-        .execute(pool)
-        .await?;
-    Ok(())
+    let pool = pool.clone();
+    // On the catalog runtime, like every other use of the pool, so a connection
+    // it opens never belongs to the caller's runtime.
+    crate::metadata_provider::connect_on_catalog_runtime(async move {
+        sqlx::raw_sql(SQL_CREATE_OVERLAY_TABLES)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    })
+    .await
 }
 
 /// The overlay `overlay_table_id` as of `snapshot_id`, or `None` if that table
 /// was not an overlay then.
+///
+/// It reads on the catalog runtime, like every other use of the pool, so a
+/// connection it opens never belongs to the caller's runtime.
 pub async fn load_overlay_base(
+    pool: &LakePool,
+    overlay_table_id: i64,
+    snapshot_id: i64,
+) -> Result<Option<OverlayBase>> {
+    let pool = pool.clone();
+    crate::metadata_provider::connect_on_catalog_runtime(async move {
+        load_overlay_base_on(&pool, overlay_table_id, snapshot_id).await
+    })
+    .await
+}
+
+async fn load_overlay_base_on(
     pool: &LakePool,
     overlay_table_id: i64,
     snapshot_id: i64,

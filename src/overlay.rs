@@ -907,7 +907,9 @@ pub async fn flush_overlay(
 }
 
 #[cfg(feature = "write")]
-pub use crate::overlay_rebase::{OverlayRebase, plan_rebase, rebase_overlay};
+pub use crate::overlay_rebase::{
+    OverlayChanges, OverlayRebase, overlay_changes, plan_rebase, rebase_overlay,
+};
 
 /// Each column's path, its name and its parents' from the top-level column
 /// down, to its id.

@@ -18,7 +18,7 @@ use testcontainers_modules::postgres::Postgres;
 use datafusion_ducklake::metadata_writer::MetadataWriter;
 use datafusion_ducklake::overlay::{
     DuckLakeOverlayTable, OverlayBase, OverlayBaseProvider, create_overlay, flush_overlay,
-    merge_overlay, plan_rebase, rebase_overlay,
+    merge_overlay, overlay_changes, plan_rebase, rebase_overlay,
 };
 use datafusion_ducklake::overlay_postgres::{initialize_overlay_schema, load_overlay_base};
 use datafusion_ducklake::{
@@ -1247,4 +1247,62 @@ async fn duckdb_reads_a_merged_underlay() {
         .collect::<Result<_, _>>()
         .unwrap();
     assert_eq!(read, expected(&[(1, "a"), (2, "B"), (4, "d")]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn an_overlays_changes_pair_by_key_into_inserts_updates_and_deletes() {
+    let lake = Lake::start().await;
+    lake.write("t", &[1, 2, 3], &["a", "b", "c"]).await;
+    lake.create("o").await;
+    lake.change("o", "UPDATE ov SET name = 'B' WHERE id = 2")
+        .await
+        .unwrap();
+    lake.change("o", "DELETE FROM ov WHERE id = 3")
+        .await
+        .unwrap();
+    lake.change("o", "INSERT INTO ov VALUES (5, 'e')")
+        .await
+        .unwrap();
+    lake.flush().await.unwrap();
+    lake.sql("UPDATE lake.main.t SET name = 'A' WHERE id = 1")
+        .await;
+
+    let table = lake.writable_overlay("o").await;
+    let old_base = lake
+        .table_at(lake.provider(), table.base().base_snapshot, "t")
+        .await;
+    let ctx = SessionContext::new();
+    let changes = overlay_changes(&table, &old_base, "id", &ctx.state())
+        .await
+        .unwrap();
+    let ctx = SessionContext::new();
+    let read = |batches: Vec<RecordBatch>| {
+        let ctx = ctx.clone();
+        async move {
+            let frame = ctx
+                .read_batches(batches)
+                .unwrap()
+                .sort_by(vec![col("id")])
+                .unwrap();
+            let mut read = Vec::new();
+            for batch in frame.collect().await.unwrap() {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                let names = arrow::compute::cast(batch.column(1), &DataType::Utf8).unwrap();
+                let names = names.as_any().downcast_ref::<StringArray>().unwrap();
+                for row in 0..batch.num_rows() {
+                    read.push((ids.value(row), names.value(row).to_string()));
+                }
+            }
+            read
+        }
+    };
+    // 2 updated, 3 deleted, 5 inserted; the underlay's own change to 1 is not
+    // the overlay's.
+    assert_eq!(read(changes.hidden).await, expected(&[(2, "b"), (3, "c")]));
+    assert_eq!(read(changes.rows).await, expected(&[(2, "B"), (5, "e")]));
 }

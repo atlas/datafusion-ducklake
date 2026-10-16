@@ -327,3 +327,56 @@ fn datafusion_error(error: DataFusionError) -> DuckLakeError {
         other => DuckLakeError::DataFusion(other),
     }
 }
+
+/// What an overlay changes, for a reviewer: the underlay rows it hides, as
+/// they were at the base, and the rows of its own table. Paired by key, a key
+/// only in `hidden` is a delete, only in `rows` an insert, and in both an
+/// update.
+#[derive(Debug, Clone)]
+pub struct OverlayChanges {
+    pub hidden: Vec<RecordBatch>,
+    pub rows: Vec<RecordBatch>,
+}
+
+/// Reads what `table` changes in its underlay. `old_base` is the underlay read
+/// plainly at the overlay's base.
+pub async fn overlay_changes(
+    table: &DuckLakeOverlayTable,
+    old_base: &DuckLakeTable,
+    key_column: &str,
+    state: &dyn Session,
+) -> Result<OverlayChanges> {
+    let base = table.base();
+    if old_base.table_id() != base.underlay_table_id || old_base.snapshot() != base.base_snapshot {
+        return Err(DuckLakeError::InvalidConfig(format!(
+            "an overlay's changes read the underlay {} at its base {}",
+            base.underlay_table_id, base.base_snapshot
+        )));
+    }
+    let visible = keys(table.underlay(), key_column, state).await?;
+    let index = key_index(old_base, key_column)?;
+    let mut hidden = Vec::new();
+    for batch in read_all(old_base, state).await? {
+        let mut keep = Vec::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            let key =
+                ScalarValue::try_from_array(batch.column(index), row).map_err(datafusion_error)?;
+            keep.push(!visible.contains(&key));
+        }
+        let keep = arrow::array::BooleanArray::from(keep);
+        let batch = arrow::compute::filter_record_batch(&batch, &keep)
+            .map_err(|error| DuckLakeError::Internal(error.to_string()))?;
+        if batch.num_rows() > 0 {
+            hidden.push(batch);
+        }
+    }
+    let rows = read_all(table.overlay(), state)
+        .await?
+        .into_iter()
+        .filter(|batch| batch.num_rows() > 0)
+        .collect();
+    Ok(OverlayChanges {
+        hidden,
+        rows,
+    })
+}

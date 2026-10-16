@@ -401,3 +401,53 @@ async fn an_overlay_refuses_columns_that_differ_from_its_underlays() {
     let overlay = lake.table_at(lake.provider(), lake.head().await, "o").await;
     assert!(DuckLakeOverlayTable::try_new(underlay, overlay).is_err());
 }
+
+/// An overlay's base is read on the catalog runtime, as every other use of a
+/// lake's pool is. A connection it opened on a single-threaded caller's runtime
+/// would be driven only while that thread awaits, so a synchronous catalog call
+/// on that thread that is handed the connection would wait forever.
+#[test]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+fn an_overlay_base_is_read_on_the_catalog_runtime() {
+    let setup = tokio::runtime::Runtime::new().unwrap();
+    let lake = setup.block_on(Lake::start());
+    setup.block_on(lake.write("t", &[1], &["a"]));
+    let table = setup.block_on(lake.table_id("t"));
+    let port = setup
+        .block_on(lake._container.get_host_port_ipv4(5432))
+        .unwrap();
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let caller = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        caller.block_on(async {
+            // Two connections, one of them open.
+            let shared = LakePool::connect(&url, 2).await.unwrap();
+            let pool = LakePool::in_schema(shared.clone(), LAKE);
+            let provider = PostgresMetadataProvider::from_lake(pool.clone());
+            let head = provider.get_current_snapshot().unwrap();
+            // With the open one taken, reading the base opens the second.
+            let held = shared.acquire().await.unwrap();
+            assert!(
+                load_overlay_base(&pool, table, head)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            // Then a synchronous call on this thread is handed the second.
+            let read = provider.get_current_snapshot();
+            drop(held);
+            done.send(read.map(|_| ()).map_err(|e| e.to_string()))
+                .unwrap();
+        });
+    });
+    let read = finished.recv_timeout(std::time::Duration::from_secs(60));
+    // Removed on a runtime, before any assertion can unwind past it.
+    setup.block_on(async move { drop(lake) });
+    read.expect("the catalog call finishes")
+        .expect("the catalog call reads");
+}

@@ -1646,6 +1646,19 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         ))
     }
 
+    /// The latest snapshot, up to `snapshot_id`, that changed table `table_id`: the one
+    /// that created it, changed its columns, or added or removed data or delete files.
+    /// `None` when the table does not exist at `snapshot_id`.
+    ///
+    /// Snapshots that changed only other tables never move it, so it orders one table's
+    /// changes without counting the lake's. Rewriting files without changing rows, as
+    /// compaction does, still moves it.
+    fn get_table_head(&self, _table_id: i64, _snapshot_id: i64) -> Result<Option<i64>> {
+        Err(DuckLakeError::Unsupported(
+            "table heads are not supported by this backend".to_string(),
+        ))
+    }
+
     /// List schemas for a specific snapshot
     fn list_schemas(&self, snapshot_id: i64) -> Result<Vec<SchemaMetadata>>;
 

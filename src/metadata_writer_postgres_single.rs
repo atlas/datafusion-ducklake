@@ -49,8 +49,9 @@ use crate::metadata_writer_postgres::{
     commit_files_at_snapshot, commit_guarded, commit_inlined_at_snapshot, commit_networked_guarded,
     detect_inlined_delete_since, detect_new_inlined_deletes,
     detect_replace_conflict as detect_staged_conflict, detect_row_mutation_conflicts,
-    drop_empty_superseded_inlined_tables_in, quote_ident, set_postgres_table_setting,
-    validate_staged_table, with_postgres_commit_lock,
+    drop_empty_superseded_inlined_tables_in, quote_ident, replaced_storage,
+    retire_prior_generation, set_postgres_table_setting, validate_staged_table,
+    with_postgres_commit_lock,
 };
 use crate::partition::PartitionTransform;
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -693,26 +694,6 @@ async fn detect_replace_conflict(
     detect_inlined_delete_since(table_id, base_snapshot, tx).await
 }
 
-/// Retire the prior generation's still-visible data files at `snapshot_id`. The `begin_snapshot < snapshot_id` guard spares files
-/// registered for *this* snapshot, so a multi-file write does not retire its
-/// own siblings. `ducklake_table_stats` is left as it is, as official's `DELETE`
-/// leaves it: `record_count` counts every row ever inserted.
-async fn retire_prior_generation(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    table_id: i64,
-    snapshot_id: i64,
-) -> Result<()> {
-    sqlx::query(
-        "UPDATE ducklake_data_file SET end_snapshot = $1
-         WHERE table_id = $2 AND end_snapshot IS NULL AND begin_snapshot < $1",
-    )
-    .bind(snapshot_id)
-    .bind(table_id)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}
-
 /// Seed the per-table stats row if absent. `ON CONFLICT DO NOTHING` on the
 /// `table_id` PK is the Postgres spelling of MySQL's `INSERT IGNORE`.
 async fn seed_table_stats(
@@ -821,19 +802,9 @@ async fn record_table_write_changes(
     has_deletes: bool,
     commit_metadata: &SnapshotCommitMetadata,
 ) -> Result<()> {
-    let replaced_existing_data: bool = sqlx::query_scalar(
-        "SELECT EXISTS(
-            SELECT 1 FROM ducklake_data_file
-            WHERE table_id = $1 AND end_snapshot = $2
-         )",
-    )
-    .bind(table_id)
-    .bind(snapshot_id)
-    .fetch_one(&mut **tx)
-    .await?;
+    let replaced = replaced_storage(tx, table_id, snapshot_id).await?;
 
-    let write_changes =
-        table_write_changes(table_id, mode, has_deletes, (replaced_existing_data, false));
+    let write_changes = table_write_changes(table_id, mode, has_deletes, replaced);
     record_table_changes(
         tx,
         snapshot_id,
@@ -1324,7 +1295,7 @@ async fn finalize_table_snapshot(
         detect_replace_conflict(tx, table_id, base_snapshot, ConflictScope::Table).await?;
         // Retire the prior data generation. A table gets its stats row with
         // its first rows, as official's `CREATE TABLE` writes none.
-        retire_prior_generation(tx, table_id, snapshot_id).await?;
+        retire_prior_generation(table_id, snapshot_id, tx).await?;
     } else if inserts {
         // An insert refuses a drop, alter or delete of the table since its
         // base snapshot, as official's does; a stage that only deletes is
@@ -2258,6 +2229,98 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
     /// deletions and inlined rows that keep their row ids, as official does.
     fn supports_inlined_row_mutations(&self) -> bool {
         true
+    }
+
+    /// Small inserts are inlined as the multi-catalog writer inlines them:
+    /// columns with PostgreSQL types the inline read path decodes back exactly,
+    /// none named like the catalog's inlined system columns or past PostgreSQL's
+    /// identifier limit.
+    fn supports_data_inlining(&self, schema: &arrow::datatypes::Schema) -> bool {
+        let Ok(system) =
+            block_on(crate::metadata_provider_postgres::catalog_inlined_system_columns(&self.pool))
+        else {
+            return false;
+        };
+        schema.fields().iter().all(|field| {
+            !system.conflicts_with(field.name())
+                && field.name().len() <= 63
+                && crate::metadata_writer_postgres::postgres_type_inlines(field.data_type())
+        })
+    }
+
+    fn supports_data_inlining_values(&self, batches: &[arrow::record_batch::RecordBatch]) -> bool {
+        batches
+            .iter()
+            .flat_map(arrow::record_batch::RecordBatch::columns)
+            .all(|array| crate::nested_inline::values_support_inlining(array.as_ref()))
+    }
+
+    fn table_types_support_inlining(&self, schema_name: &str, table_name: &str) -> Result<bool> {
+        block_on(async {
+            let refused: bool = sqlx::query_scalar(AssertSqlSafe(format!(
+                "SELECT EXISTS(
+                     SELECT 1 FROM ducklake_column c
+                     JOIN ducklake_table t ON t.table_id = c.table_id
+                     JOIN ducklake_schema s ON s.schema_id = t.schema_id
+                     WHERE s.schema_name = $1 AND s.end_snapshot IS NULL
+                       AND t.table_name = $2 AND t.end_snapshot IS NULL
+                       AND c.end_snapshot IS NULL AND LOWER(c.column_type) IN ({}))",
+                crate::types::sql_uninlinable_types()
+            )))
+            .bind(schema_name)
+            .bind(table_name)
+            .fetch_one(&self.pool)
+            .await?;
+            Ok(!refused)
+        })
+    }
+
+    /// Stores a small insert as rows in the table's inlined data table: one
+    /// staged inlined write, committed as [`Self::commit_multi_table`] commits
+    /// any, so a Replace ends the prior generation's files and inlined rows and
+    /// the statistics merge as official's do.
+    #[allow(clippy::too_many_arguments)]
+    fn register_inlined_data(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        _snapshot_id: i64,
+        batches: &[arrow::record_batch::RecordBatch],
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+        commit_metadata: &SnapshotCommitMetadata,
+        expected_base_snapshot_id: Option<i64>,
+    ) -> Result<CommitIds> {
+        let write = StagedTableWrite {
+            table_id,
+            schema_name: schema_name.to_string(),
+            table_name: table_name.to_string(),
+            base_snapshot_id: base_snapshot,
+            mode,
+            columns: columns.to_vec(),
+            column_ids: column_ids.to_vec(),
+            data: StagedTableData::Inlined(batches.to_vec()),
+            snapshot_id_columns: Vec::new(),
+            positional_deletes: Vec::new(),
+            inlined_deletes: Vec::new(),
+            inlined_row_ids: None,
+            inlined_file_deletes: Vec::new(),
+            rewritten_deletes: Vec::new(),
+            dropped_files: Vec::new(),
+            inlined_flush: false,
+        };
+        let committed =
+            self.commit_multi_table(&[write], commit_metadata, expected_base_snapshot_id)?;
+        let mut tables = committed.tables.into_iter();
+        match (tables.next(), tables.next()) {
+            (Some(ids), None) => Ok(ids),
+            _ => Err(crate::DuckLakeError::Internal(
+                "an inlined write committed other than one table".to_string(),
+            )),
+        }
     }
 
     fn set_partition_spec(

@@ -136,6 +136,10 @@ impl MetadataProvider for OverlayBaseProvider {
         self.inner.find_snapshot_by_commit_extra_info(needle)
     }
 
+    fn get_table_head(&self, table_id: i64, snapshot_id: i64) -> Result<Option<i64>> {
+        self.inner.get_table_head(table_id, snapshot_id)
+    }
+
     fn list_schemas(&self, snapshot_id: i64) -> Result<Vec<SchemaMetadata>> {
         self.inner.list_schemas(snapshot_id)
     }

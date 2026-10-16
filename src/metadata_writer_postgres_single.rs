@@ -1534,6 +1534,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 || !overlay.hide_inlined.is_empty()
                 || !overlay.fold.is_empty()
                 || overlay.create.is_some()
+                || overlay.rebase.is_some()
             {
                 record_snapshot_changes(
                     &mut tx,

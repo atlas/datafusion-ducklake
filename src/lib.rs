@@ -152,6 +152,8 @@ pub mod multicatalog;
 #[cfg(feature = "multicatalog-postgres")]
 pub mod multicatalog_provider;
 #[cfg(feature = "write")]
+mod overlay_rebase;
+#[cfg(feature = "write")]
 mod overlay_write;
 #[cfg(feature = "write")]
 pub mod sql;

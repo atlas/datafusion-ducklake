@@ -1767,3 +1767,73 @@ async fn a_write_staged_before_a_drop_is_refused() {
             .is_err()
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_tables_head_moves_with_its_own_changes_only() {
+    let (writer, pool, conn_str, _tmp, _container) = setup().await.unwrap();
+    let tw = DuckLakeTableWriter::new(Arc::new(writer.clone()), object_store()).unwrap();
+    let created = tw
+        .write_table("main", "t", &[batch(vec![1], vec![Some("a")])])
+        .await
+        .unwrap()
+        .snapshot_id;
+    let table: i64 = sqlx::query_scalar(
+        "SELECT table_id FROM ducklake_table WHERE table_name = 't' AND end_snapshot IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let provider = PostgresMetadataProvider::new(&conn_str).await.unwrap();
+    assert_eq!(
+        provider.get_table_head(table, created).unwrap(),
+        Some(created)
+    );
+
+    // Another table's write is not this table's change.
+    let other = tw
+        .write_table("main", "other", &[batch(vec![1], vec![None])])
+        .await
+        .unwrap()
+        .snapshot_id;
+    assert!(other > created);
+    assert_eq!(
+        provider.get_table_head(table, other).unwrap(),
+        Some(created)
+    );
+
+    // Its own rows move it, and an earlier snapshot still answers as it was.
+    let rows = batch(vec![2], vec![None]);
+    let mut transaction = tw.transaction();
+    transaction
+        .stage_write(
+            "main",
+            "t",
+            &rows.schema(),
+            WriteMode::Append,
+            std::slice::from_ref(&rows),
+        )
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+    let appended = provider.get_current_snapshot().unwrap();
+    assert!(appended > other);
+    assert_eq!(
+        provider.get_table_head(table, appended).unwrap(),
+        Some(appended)
+    );
+    assert_eq!(
+        provider.get_table_head(table, other).unwrap(),
+        Some(created)
+    );
+
+    // Before it was created, and once it is dropped, it has none.
+    assert_eq!(provider.get_table_head(table, created - 1).unwrap(), None);
+    assert!(writer.drop_table("main", "t").await.unwrap());
+    let dropped = provider.get_current_snapshot().unwrap();
+    assert_eq!(provider.get_table_head(table, dropped).unwrap(), None);
+    assert_eq!(
+        provider.get_table_head(table, appended).unwrap(),
+        Some(appended)
+    );
+}

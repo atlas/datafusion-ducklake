@@ -1462,6 +1462,44 @@ impl MetadataProvider for PostgresMetadataProvider {
         })
     }
 
+    fn get_table_head(&self, table_id: i64, snapshot_id: i64) -> Result<Option<i64>> {
+        block_on(async {
+            // Every catalog row of the table begins, and may end, at a snapshot that
+            // changed it. Only those up to `snapshot_id` count, and none at all when the
+            // table is not live there.
+            let row = sqlx::query(
+                "SELECT MAX(changed) FROM (
+                    SELECT begin_snapshot AS changed FROM ducklake_table
+                        WHERE table_id = $1 AND begin_snapshot <= $2
+                    UNION ALL SELECT end_snapshot FROM ducklake_table
+                        WHERE table_id = $1 AND end_snapshot <= $2
+                    UNION ALL SELECT begin_snapshot FROM ducklake_column
+                        WHERE table_id = $1 AND begin_snapshot <= $2
+                    UNION ALL SELECT end_snapshot FROM ducklake_column
+                        WHERE table_id = $1 AND end_snapshot <= $2
+                    UNION ALL SELECT begin_snapshot FROM ducklake_data_file
+                        WHERE table_id = $1 AND begin_snapshot <= $2
+                    UNION ALL SELECT end_snapshot FROM ducklake_data_file
+                        WHERE table_id = $1 AND end_snapshot <= $2
+                    UNION ALL SELECT begin_snapshot FROM ducklake_delete_file
+                        WHERE table_id = $1 AND begin_snapshot <= $2
+                    UNION ALL SELECT end_snapshot FROM ducklake_delete_file
+                        WHERE table_id = $1 AND end_snapshot <= $2
+                ) AS changes
+                WHERE EXISTS (
+                    SELECT 1 FROM ducklake_table
+                    WHERE table_id = $1 AND begin_snapshot <= $2
+                      AND (end_snapshot IS NULL OR end_snapshot > $2)
+                )",
+            )
+            .bind(table_id)
+            .bind(snapshot_id)
+            .fetch_one(&self.pool)
+            .await?;
+            Ok(row.try_get::<Option<i64>, _>(0)?)
+        })
+    }
+
     fn get_data_path(&self) -> Result<String> {
         self.get_metadata_settings(None, None)?
             .remove("data_path")

@@ -3,3 +3,9 @@
 # Install: cargo install sccache
 # To enable: Set RUSTC_WRAPPER=sccache in your environment
 # rustc-wrapper = "sccache"  # Uncomment after installing sccache
+
+# The `atlas` package registry this branch's manifests name. Publishing sets
+# CARGO_REGISTRIES_ATLAS_INDEX; nothing else contacts this address.
+[registries.atlas]
+index = "sparse+http://127.0.0.1:18000/api/v1/crates/"
+credential-provider = "cargo:token"

@@ -3199,6 +3199,10 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// Implementations allocate one snapshot, evaluate the optional table-state
     /// fence once for the complete write, and make every table change visible
     /// together. A returned error must leave no staged metadata visible.
+    /// `writes` holds one stage per table, which
+    /// [`DuckLakeWriteTransaction`](crate::DuckLakeWriteTransaction) guarantees
+    /// by joining successive staging calls for a table; implementations refuse
+    /// a second stage of one table.
     fn commit_multi_table(
         &self,
         _writes: &[StagedTableWrite],

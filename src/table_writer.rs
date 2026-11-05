@@ -446,6 +446,9 @@ struct PreparedTableWrite {
     records_written: i64,
     /// What each of `write.rewritten_deletes` holds, in the same order.
     rewrite_sources: Vec<RewrittenDeleteSource>,
+    /// Staged by [`DuckLakeWriteTransaction::stage_row_mutation`], which no
+    /// other stage of its table joins.
+    row_mutation: bool,
 }
 
 /// What a statement's rewritten delete file holds, kept so the commit can
@@ -496,6 +499,18 @@ fn retry_wait(attempt: u32) -> std::time::Duration {
 /// ignore missing row identities and rows inserted by the same transaction;
 /// concurrent changes still conflict. An explicit expected-base snapshot adds
 /// a table-state precondition, including for append stages.
+///
+/// Successive staging calls for one table join one stage, so a caller can
+/// stage a table's rows and deletes a chunk at a time and still commit them
+/// as one change with one [`WriteResult`]. Each call uploads its rows as it is
+/// staged; data files keep their staging order, so the commit hands out row
+/// ids across the chunks in order. A joining call is refused with
+/// [`InvalidConfig`](crate::DuckLakeError::InvalidConfig), and its own files
+/// removed, when it would change what the stage means: a different table
+/// generation, mode or columns; inlined rows next to data files (a chunk
+/// that inlined where another did not); a second delete file for one data
+/// file; commit-snapshot columns; or a table staged by a SQL `UPDATE` or
+/// `DELETE`. A table this transaction creates is staged in one call.
 #[derive(Debug)]
 pub struct DuckLakeWriteTransaction<'a> {
     writer: &'a DuckLakeTableWriter,
@@ -503,6 +518,10 @@ pub struct DuckLakeWriteTransaction<'a> {
     commit_metadata: SnapshotCommitMetadata,
     expected_base_snapshot_id: Option<i64>,
     delete_file_positions: Option<DeleteFilePositionsRef<'a>>,
+    /// Objects handed to a staging call that was refused and could not remove
+    /// them itself: removed with the staged ones when the transaction aborts or
+    /// fails, and after it commits.
+    unstaged: Vec<ObjectPath>,
 }
 
 /// A data file's live delete file: its id and every position it deletes.
@@ -631,6 +650,7 @@ impl DuckLakeTableWriter {
             commit_metadata: SnapshotCommitMetadata::default(),
             expected_base_snapshot_id: None,
             delete_file_positions: None,
+            unstaged: Vec::new(),
         }
     }
 
@@ -2373,6 +2393,7 @@ impl DuckLakeTableWriter {
                 files_written: 0,
                 records_written: records_written as i64,
                 rewrite_sources: Vec::new(),
+                row_mutation: false,
             });
         }
 
@@ -2465,6 +2486,7 @@ impl DuckLakeTableWriter {
             files_written,
             records_written,
             rewrite_sources: Vec::new(),
+            row_mutation: false,
         })
     }
 
@@ -2738,6 +2760,8 @@ impl DuckLakeWriteTransaction<'_> {
     }
 
     /// Stages one table write without committing catalog metadata.
+    ///
+    /// A table staged already joins these rows to its stage.
     pub async fn stage_write(
         &mut self,
         schema_name: &str,
@@ -2754,11 +2778,12 @@ impl DuckLakeWriteTransaction<'_> {
             .writer
             .prepare_rows_inner(schema_name, table_name, arrow_schema, mode, batches, true)
             .await?;
-        self.writes.push(prepared);
-        Ok(())
+        self.join_stage(prepared).await
     }
 
     /// Stages one table write with options that apply only to this stage.
+    ///
+    /// A table staged already joins these rows to its stage.
     pub async fn stage_write_with_options(
         &mut self,
         schema_name: &str,
@@ -2776,11 +2801,12 @@ impl DuckLakeWriteTransaction<'_> {
         let prepared = writer
             .prepare_rows_inner(schema_name, table_name, arrow_schema, mode, batches, true)
             .await?;
-        self.writes.push(prepared);
-        Ok(())
+        self.join_stage(prepared).await
     }
 
     /// Stages an inline write whose nullable snapshot columns use the commit snapshot.
+    ///
+    /// Refused for a table staged already, and no later call joins it.
     #[allow(clippy::too_many_arguments)]
     pub async fn stage_write_with_snapshot_columns(
         &mut self,
@@ -2795,7 +2821,32 @@ impl DuckLakeWriteTransaction<'_> {
         if batches.iter().all(|batch| batch.num_rows() == 0) {
             return Ok(());
         }
+        let prepared = self
+            .prepare_snapshot_column_rows(
+                schema_name,
+                table_name,
+                arrow_schema,
+                mode,
+                batches,
+                options,
+                snapshot_id_columns,
+            )
+            .await?;
+        self.join_stage(prepared).await
+    }
 
+    /// The inlined rows of [`Self::stage_write_with_snapshot_columns`], not yet staged.
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_snapshot_column_rows(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        arrow_schema: &Schema,
+        mode: WriteMode,
+        batches: &[RecordBatch],
+        options: &DuckLakeWriteOptions,
+        snapshot_id_columns: &[&str],
+    ) -> Result<PreparedTableWrite> {
         let writer = self.writer.clone().with_options(options);
         if !writer.should_inline(
             schema_name,
@@ -2826,11 +2877,12 @@ impl DuckLakeWriteTransaction<'_> {
             .iter()
             .map(|name| (*name).to_string())
             .collect();
-        self.writes.push(prepared);
-        Ok(())
+        Ok(prepared)
     }
 
     /// Stages an inline write with deletes and commit-snapshot columns.
+    ///
+    /// Refused for a table staged already, and no later call joins it.
     #[allow(clippy::too_many_arguments)]
     pub async fn stage_write_with_deletes_and_snapshot_columns(
         &mut self,
@@ -2857,41 +2909,28 @@ impl DuckLakeWriteTransaction<'_> {
         if !positional_deletes.is_empty() {
             validate_delete_entries(mode, positional_deletes)?;
         }
-        let delete_paths = positional_deletes
-            .iter()
-            .map(|entry| {
-                self.writer.staged_object_path(
-                    schema_name,
-                    table_name,
-                    &entry.delete.path,
-                    entry.delete.path_is_relative,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.stage_write_with_snapshot_columns(
-            schema_name,
-            table_name,
-            arrow_schema,
-            mode,
-            batches,
-            options,
-            snapshot_id_columns,
-        )
-        .await?;
+        let delete_paths = self.delete_paths(schema_name, table_name, positional_deletes)?;
         let prepared = self
-            .writes
-            .last_mut()
-            .expect("snapshot-column stage appended one table");
-        prepared.object_paths.extend(delete_paths);
-        prepared.write.positional_deletes = positional_deletes.to_vec();
-        prepared.write.inlined_deletes = inlined_deletes.to_vec();
-        Ok(())
+            .prepare_snapshot_column_rows(
+                schema_name,
+                table_name,
+                arrow_schema,
+                mode,
+                batches,
+                options,
+                snapshot_id_columns,
+            )
+            .await;
+        self.join_with_deletes(prepared, delete_paths, positional_deletes, inlined_deletes)
+            .await
     }
 
     /// Stages inserted rows and deletes for one table.
     ///
     /// The transaction takes ownership of the positional delete objects and removes them if the
-    /// transaction aborts or its metadata commit fails with nothing committed.
+    /// transaction aborts or its metadata commit fails with nothing committed. A table staged
+    /// already joins these rows and deletes to its stage, which may hold one delete file per
+    /// data file.
     #[allow(clippy::too_many_arguments)]
     pub async fn stage_write_with_deletes(
         &mut self,
@@ -2916,8 +2955,23 @@ impl DuckLakeWriteTransaction<'_> {
         if !positional_deletes.is_empty() {
             validate_delete_entries(mode, positional_deletes)?;
         }
+        let delete_paths = self.delete_paths(schema_name, table_name, positional_deletes)?;
+        let prepared = self
+            .writer
+            .prepare_rows_inner(schema_name, table_name, arrow_schema, mode, batches, true)
+            .await;
+        self.join_with_deletes(prepared, delete_paths, positional_deletes, inlined_deletes)
+            .await
+    }
 
-        let delete_paths = positional_deletes
+    /// The object paths of `positional_deletes`' delete files.
+    fn delete_paths(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        positional_deletes: &[DeleteFileEntry],
+    ) -> Result<Vec<ObjectPath>> {
+        positional_deletes
             .iter()
             .map(|entry| {
                 self.writer.staged_object_path(
@@ -2927,34 +2981,42 @@ impl DuckLakeWriteTransaction<'_> {
                     entry.delete.path_is_relative,
                 )
             })
-            .collect::<Result<Vec<_>>>()?;
-        if let Err(e) = self
-            .stage_write(schema_name, table_name, arrow_schema, mode, batches)
-            .await
-        {
-            // The delete files were handed over with this call, and will never
-            // be committed now, so nothing else would remove them.
-            for path in &delete_paths {
-                if let Err(cleanup) = self.writer.object_store.delete(path).await {
-                    tracing::warn!(%path, error = %cleanup, "a staged delete file was not removed");
+            .collect()
+    }
+
+    /// Stages `prepared` rows with the deletes handed over with them. When
+    /// preparing the rows failed, the delete files, which will never be
+    /// committed now, are removed, as nothing else would remove them.
+    async fn join_with_deletes(
+        &mut self,
+        prepared: Result<PreparedTableWrite>,
+        delete_paths: Vec<ObjectPath>,
+        positional_deletes: &[DeleteFileEntry],
+        inlined_deletes: &[InlinedRowRef],
+    ) -> Result<()> {
+        let mut prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                let owned = self.owned_paths();
+                for path in delete_paths.iter().filter(|path| !owned.contains(path)) {
+                    if let Err(cleanup) = self.writer.object_store.delete(path).await {
+                        tracing::warn!(%path, error = %cleanup, "a staged delete file was not removed");
+                    }
                 }
-            }
-            return Err(e);
-        }
-        let prepared = self
-            .writes
-            .last_mut()
-            .expect("stage_write appended one table");
+                return Err(e);
+            },
+        };
         prepared.object_paths.extend(delete_paths);
         prepared.write.positional_deletes = positional_deletes.to_vec();
         prepared.write.inlined_deletes = inlined_deletes.to_vec();
-        Ok(())
+        self.join_stage(prepared).await
     }
 
     /// Stages deletes for a table without inserting replacement rows.
     ///
     /// The transaction takes ownership of the positional delete objects and removes them if the
-    /// transaction aborts or its metadata commit fails with nothing committed.
+    /// transaction aborts or its metadata commit fails with nothing committed. A table staged
+    /// already joins these deletes to its stage, which may hold one delete file per data file.
     pub fn stage_deletes(
         &mut self,
         schema_name: &str,
@@ -2977,18 +3039,8 @@ impl DuckLakeWriteTransaction<'_> {
             &columns,
             WriteMode::Append,
         )?;
-        let object_paths = positional_deletes
-            .iter()
-            .map(|entry| {
-                self.writer.staged_object_path(
-                    schema_name,
-                    table_name,
-                    &entry.delete.path,
-                    entry.delete.path_is_relative,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.writes.push(PreparedTableWrite {
+        let object_paths = self.delete_paths(schema_name, table_name, positional_deletes)?;
+        let prepared = PreparedTableWrite {
             write: StagedTableWrite {
                 table_id: setup.table_id,
                 schema_name: schema_name.to_string(),
@@ -3011,7 +3063,66 @@ impl DuckLakeWriteTransaction<'_> {
             files_written: 0,
             records_written: 0,
             rewrite_sources: Vec::new(),
+            row_mutation: false,
+        };
+        // Synchronous, so a refused call's files are removed with the
+        // transaction's own when it ends.
+        if let Err((error, refused)) = self.add_stage(prepared) {
+            self.unstaged.extend(refused);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Every object a stage of this transaction owns.
+    fn owned_paths(&self) -> std::collections::HashSet<ObjectPath> {
+        self.writes
+            .iter()
+            .flat_map(|prepared| prepared.object_paths.iter().cloned())
+            .collect()
+    }
+
+    /// Stages `prepared`, removing its files when it is refused.
+    async fn join_stage(&mut self, prepared: PreparedTableWrite) -> Result<()> {
+        let Err((error, refused)) = self.add_stage(prepared) else {
+            return Ok(());
+        };
+        let failures = remove_objects(&self.writer.object_store, refused).await;
+        if !failures.is_empty() {
+            tracing::warn!(
+                failures = %failures.join("; "),
+                "a refused stage's files were not removed"
+            );
+        }
+        Err(error)
+    }
+
+    /// Adds `prepared` as the stage of its table, or joins it to the stage of
+    /// that table staged already. A refusal returns the objects of `prepared`
+    /// that no stage owns, for the caller to remove.
+    fn add_stage(
+        &mut self,
+        prepared: PreparedTableWrite,
+    ) -> std::result::Result<(), (crate::DuckLakeError, Vec<ObjectPath>)> {
+        let existing = self.writes.iter().position(|staged| {
+            staged.write.table_id == prepared.write.table_id
+                || (staged.write.schema_name == prepared.write.schema_name
+                    && staged.write.table_name == prepared.write.table_name)
         });
+        let Some(existing) = existing else {
+            self.writes.push(prepared);
+            return Ok(());
+        };
+        if let Err(error) = joinable(&self.writes[existing], &prepared) {
+            let owned = self.owned_paths();
+            let refused = prepared
+                .object_paths
+                .into_iter()
+                .filter(|path| !owned.contains(path))
+                .collect();
+            return Err((error, refused));
+        }
+        join(&mut self.writes[existing], prepared);
         Ok(())
     }
 
@@ -3114,6 +3225,16 @@ impl DuckLakeWriteTransaction<'_> {
         dropped_files: Vec<crate::metadata_writer::DroppedDataFile>,
     ) -> Result<()> {
         validate_delete_entries(WriteMode::Append, &positional_deletes)?;
+        if self.writes.iter().any(|staged| {
+            staged.write.table_id == table_id
+                || (staged.write.schema_name == schema_name
+                    && staged.write.table_name == table_name)
+        }) {
+            return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                "{schema_name}.{table_name} is staged already; a SQL UPDATE or DELETE is the \
+                 only stage of its table"
+            )));
+        }
         let (rewritten_deletes, rewrite_sources): (Vec<_>, Vec<_>) = rewritten
             .into_iter()
             .map(|rewritten| (rewritten.entry, rewritten.source))
@@ -3186,6 +3307,7 @@ impl DuckLakeWriteTransaction<'_> {
             files_written,
             records_written,
             rewrite_sources,
+            row_mutation: true,
         });
         Ok(())
     }
@@ -3207,6 +3329,7 @@ impl DuckLakeWriteTransaction<'_> {
     /// [`DuckLakeError::Conflict`](crate::DuckLakeError::Conflict).
     pub async fn commit(mut self) -> Result<Vec<WriteResult>> {
         if self.writes.is_empty() {
+            self.cleanup().await?;
             return Ok(Vec::new());
         }
         let mut attempt = 0;
@@ -3282,6 +3405,15 @@ impl DuckLakeWriteTransaction<'_> {
                 committed.tables.len(),
                 self.writes.len()
             )));
+        }
+        // Files of refused staging calls, which nothing references.
+        let unstaged = std::mem::take(&mut self.unstaged);
+        let failures = remove_objects(&self.writer.object_store, unstaged).await;
+        if !failures.is_empty() {
+            tracing::warn!(
+                failures = %failures.join("; "),
+                "a refused stage's files were not removed"
+            );
         }
 
         Ok(self
@@ -3434,6 +3566,7 @@ impl DuckLakeWriteTransaction<'_> {
             .writes
             .iter()
             .flat_map(|prepared| prepared.object_paths.iter().cloned())
+            .chain(self.unstaged.drain(..))
             .collect();
         let failures = remove_objects(&self.writer.object_store, paths).await;
         if !failures.is_empty() {
@@ -3444,6 +3577,123 @@ impl DuckLakeWriteTransaction<'_> {
         }
         Ok(())
     }
+}
+
+/// Whether `next`, a later staging call for the table `staged` stages, can
+/// join that stage without changing what it means.
+fn joinable(staged: &PreparedTableWrite, next: &PreparedTableWrite) -> Result<()> {
+    let (a, b) = (&staged.write, &next.write);
+    let refuse = |why: &str| {
+        Err(crate::DuckLakeError::InvalidConfig(format!(
+            "{}.{} is staged already and this stage cannot join it: {why}",
+            b.schema_name, b.table_name
+        )))
+    };
+    if staged.row_mutation || next.row_mutation {
+        return refuse("the table is changed by a SQL UPDATE or DELETE in this transaction");
+    }
+    if a.table_id != b.table_id {
+        return refuse(
+            "it resolved to another table id; a table the transaction creates is staged in one call",
+        );
+    }
+    if a.mode != b.mode {
+        return refuse("the write mode differs");
+    }
+    if a.column_ids != b.column_ids || !same_columns(&a.columns, &b.columns) {
+        return refuse("the table's columns differ");
+    }
+    for write in [a, b] {
+        if !write.snapshot_id_columns.is_empty() {
+            return refuse("a stage with commit snapshot columns is staged in one call");
+        }
+        if !write.rewritten_deletes.is_empty() || !write.dropped_files.is_empty() {
+            return refuse("a stage that rewrites delete files or drops data files cannot join");
+        }
+        if write.inlined_flush {
+            return refuse("an inlined-data flush is staged in one call");
+        }
+        if write.inlined_row_ids.is_some() {
+            return refuse("inlined rows that keep their row ids are staged in one call");
+        }
+    }
+    match (&a.data, &b.data) {
+        (StagedTableData::Files(_), StagedTableData::Files(_))
+        | (StagedTableData::Inlined(_), StagedTableData::Inlined(_))
+        | (StagedTableData::None, _)
+        | (_, StagedTableData::None) => {},
+        _ => return refuse("one stage inlines its rows and the other writes data files"),
+    }
+    if let Some(entry) = b.positional_deletes.iter().find(|entry| {
+        a.positional_deletes
+            .iter()
+            .any(|staged| staged.data_file_id == entry.data_file_id)
+    }) {
+        return refuse(&format!(
+            "data file {} has a delete file staged already; a commit takes one per data file",
+            entry.data_file_id
+        ));
+    }
+    Ok(())
+}
+
+/// Whether two stages' columns are the same catalog columns. Their Arrow
+/// types may differ in representation (`Utf8` for `Utf8View`) without
+/// changing the column, which `column_ids` and the DuckLake type pin.
+fn same_columns(a: &[ColumnDef], b: &[ColumnDef]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(a, b)| {
+            a.name == b.name
+                && a.ducklake_type == b.ducklake_type
+                && a.is_nullable == b.is_nullable
+                && a.initial_default == b.initial_default
+                && a.default_value == b.default_value
+                && a.default_value_type == b.default_value_type
+                && a.default_value_dialect == b.default_value_dialect
+        })
+}
+
+/// Joins `next` to `staged`, which [`joinable`] accepted: rows and deletes
+/// follow those staged, in staging order.
+fn join(staged: &mut PreparedTableWrite, next: PreparedTableWrite) {
+    let PreparedTableWrite {
+        write: next_write,
+        object_paths,
+        files_written,
+        records_written,
+        rewrite_sources: _,
+        row_mutation: _,
+    } = next;
+    let write = &mut staged.write;
+    // The earlier base is the stricter: a change since either conflicts.
+    write.base_snapshot_id = write.base_snapshot_id.min(next_write.base_snapshot_id);
+    let data = std::mem::replace(&mut write.data, StagedTableData::None);
+    write.data = match (data, next_write.data) {
+        (StagedTableData::Files(mut files), StagedTableData::Files(more)) => {
+            files.extend(more);
+            StagedTableData::Files(files)
+        },
+        (StagedTableData::Inlined(mut batches), StagedTableData::Inlined(more)) => {
+            batches.extend(more);
+            StagedTableData::Inlined(batches)
+        },
+        (StagedTableData::None, data) => {
+            // The stage's columns are those of its rows.
+            write.columns = next_write.columns;
+            data
+        },
+        (data, _) => data,
+    };
+    write
+        .positional_deletes
+        .extend(next_write.positional_deletes);
+    write.inlined_deletes.extend(next_write.inlined_deletes);
+    write
+        .inlined_file_deletes
+        .extend(next_write.inlined_file_deletes);
+    staged.object_paths.extend(object_paths);
+    staged.files_written += files_written;
+    staged.records_written += records_written;
 }
 
 /// Whether a failed commit is known to have registered nothing: every failure

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `DuckLakeWriteTransaction` joins successive staging calls for one table into one stage, so a
+  table's rows and deletes can be staged a chunk at a time and committed as one snapshot.
 - `MetadataProvider::scan_inlined_data_noting_absence` also reports the latest snapshot through
   which a table has no inlined rows. The PostgreSQL and multicatalog providers implement it.
 - `MulticatalogProvider::begin_read_session` takes one pooled connection for a query, and

@@ -85,6 +85,7 @@ mod positional_delete_oracle_postgres_tests;
 mod positional_delete_oracle_tests;
 mod positional_delete_tests;
 mod positional_pushdown_tests;
+mod postgres_chunked_stage_tests;
 mod postgres_geometry_tests;
 mod postgres_lake_schema_tests;
 mod postgres_metadata_provider_test;

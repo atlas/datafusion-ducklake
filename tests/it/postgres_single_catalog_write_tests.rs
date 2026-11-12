@@ -1840,6 +1840,99 @@ async fn a_tables_head_moves_with_its_own_changes_only() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_tables_changes_are_listed_with_their_commit_metadata_inlined_rows_included() {
+    use datafusion_ducklake::{SnapshotCommitMetadata, TableWriteOptions};
+
+    let (writer, pool, conn_str, _tmp, _container) = setup().await.unwrap();
+    let tw = DuckLakeTableWriter::new(Arc::new(writer.clone()), object_store()).unwrap();
+    let created = tw
+        .write_table("main", "t", &[batch(vec![1], vec![Some("a")])])
+        .await
+        .unwrap();
+    let table = created.table_id;
+
+    // Another table's write, and a change of this one's sort order, change none of its rows.
+    tw.write_table("main", "other", &[batch(vec![1], vec![None])])
+        .await
+        .unwrap();
+    let field = SortField {
+        sort_key_index: 0,
+        expression: "id".to_string(),
+        dialect: "duckdb".to_string(),
+        direction: SortDirection::Asc,
+        null_order: NullOrder::NullsLast,
+    };
+    let sorted = writer.set_sort_spec(table, &[field]).unwrap();
+
+    // Rows written to a file, with commit metadata, and rows inlined into the catalog.
+    let options = TableWriteOptions::new()
+        .with_commit_metadata(SnapshotCommitMetadata::new().with_extra_info("load:1"));
+    let rows = batch(vec![2], vec![None]);
+    let mut transaction = tw.transaction().with_options(&options);
+    transaction
+        .stage_write(
+            "main",
+            "t",
+            &rows.schema(),
+            WriteMode::Append,
+            std::slice::from_ref(&rows),
+        )
+        .await
+        .unwrap();
+    let appended = transaction.commit().await.unwrap()[0].snapshot_id;
+    // Rows a participant inlined into the catalog, as official records them: a snapshot
+    // that names the table in its change ledger and adds no file. Written directly, as
+    // the inlined-data tests write official's encodings, since this writer writes files.
+    let inlined = writer.create_snapshot().unwrap();
+    sqlx::query(
+        "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+         VALUES ($1, 'inserted_into_table:' || $2)
+         ON CONFLICT (snapshot_id) DO UPDATE SET changes_made = EXCLUDED.changes_made",
+    )
+    .bind(inlined)
+    .bind(table)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let files: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ducklake_data_file WHERE table_id = $1 AND begin_snapshot = $2",
+    )
+    .bind(table)
+    .bind(inlined)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(files, 0, "the rows were inlined, in no file");
+
+    let provider = PostgresMetadataProvider::new(&conn_str).await.unwrap();
+    let listed = |after: Option<i64>| {
+        provider
+            .list_table_changes(table, after)
+            .unwrap()
+            .into_iter()
+            .map(|change| (change.snapshot_id, change.commit_extra_info))
+            .collect::<Vec<_>>()
+    };
+    assert!(sorted > created.snapshot_id && sorted < appended);
+    assert_eq!(
+        listed(None),
+        [(created.snapshot_id, None), (appended, Some("load:1".to_string())), (inlined, None),]
+    );
+    // After a snapshot, only the changes since.
+    assert_eq!(
+        listed(Some(created.snapshot_id)),
+        [(appended, Some("load:1".to_string())), (inlined, None)]
+    );
+    assert_eq!(listed(Some(inlined)), []);
+
+    // Dropping it is a change of it too.
+    assert!(writer.drop_table("main", "t").await.unwrap());
+    let dropped = provider.get_current_snapshot().unwrap();
+    assert_eq!(listed(Some(inlined)), [(dropped, None)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn a_commit_is_found_by_its_metadata_after_its_files_are_ended_and_after_a_snapshot() {
     use datafusion_ducklake::{SnapshotCommitMetadata, TableWriteOptions};
 

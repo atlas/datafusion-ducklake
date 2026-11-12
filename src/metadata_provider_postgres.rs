@@ -1480,6 +1480,83 @@ impl MetadataProvider for PostgresMetadataProvider {
         })
     }
 
+    fn list_table_changes(
+        &self,
+        table_id: i64,
+        after: Option<i64>,
+    ) -> Result<Vec<SnapshotChangeMetadata>> {
+        block_on(async {
+            // A snapshot changed the table if a catalog row of it began or ended there, or
+            // if its change-ledger entry names the table by a change to its rows: inlined
+            // rows and flushes leave no file row, and official names them only there. Its
+            // sort and partition rows, and `altered_table` alone, do not count.
+            let after = after.unwrap_or(-1);
+            let rows = sqlx::query(
+                "WITH changed AS (
+                    SELECT begin_snapshot AS snapshot_id FROM ducklake_table
+                        WHERE table_id = $1 AND begin_snapshot > $2
+                    UNION SELECT end_snapshot FROM ducklake_table
+                        WHERE table_id = $1 AND end_snapshot > $2
+                    UNION SELECT begin_snapshot FROM ducklake_column
+                        WHERE table_id = $1 AND begin_snapshot > $2
+                    UNION SELECT end_snapshot FROM ducklake_column
+                        WHERE table_id = $1 AND end_snapshot > $2
+                    UNION SELECT begin_snapshot FROM ducklake_data_file
+                        WHERE table_id = $1 AND begin_snapshot > $2
+                    UNION SELECT end_snapshot FROM ducklake_data_file
+                        WHERE table_id = $1 AND end_snapshot > $2
+                    UNION SELECT begin_snapshot FROM ducklake_delete_file
+                        WHERE table_id = $1 AND begin_snapshot > $2
+                    UNION SELECT end_snapshot FROM ducklake_delete_file
+                        WHERE table_id = $1 AND end_snapshot > $2
+                    UNION SELECT snapshot_id FROM ducklake_snapshot_changes
+                        WHERE snapshot_id > $2
+                          AND snapshot_id >= (
+                              SELECT MIN(begin_snapshot) FROM ducklake_table WHERE table_id = $1
+                          )
+                          AND string_to_array(changes_made, ',') && ARRAY[
+                              'inserted_into_table:' || $1,
+                              'deleted_from_table:' || $1,
+                              'inlined_insert:' || $1,
+                              'inlined_delete:' || $1,
+                              'inline_flush:' || $1,
+                              'merge_adjacent:' || $1,
+                              'rewrite_delete:' || $1,
+                              'compacted_table:' || $1,
+                              'dropped_table:' || $1
+                          ]::TEXT[]
+                 )
+                 SELECT snapshot.snapshot_id,
+                        snapshot.snapshot_time::text AS snapshot_time,
+                        changes.changes_made,
+                        changes.author,
+                        changes.commit_message,
+                        changes.commit_extra_info
+                 FROM changed
+                 JOIN ducklake_snapshot AS snapshot ON snapshot.snapshot_id = changed.snapshot_id
+                 LEFT JOIN ducklake_snapshot_changes AS changes
+                   ON changes.snapshot_id = snapshot.snapshot_id
+                 ORDER BY snapshot.snapshot_id",
+            )
+            .bind(table_id)
+            .bind(after)
+            .fetch_all(&self.pool)
+            .await?;
+            rows.into_iter()
+                .map(|row| {
+                    Ok(SnapshotChangeMetadata {
+                        snapshot_id: row.try_get("snapshot_id")?,
+                        timestamp: row.try_get("snapshot_time")?,
+                        changes_made: row.try_get("changes_made")?,
+                        author: row.try_get("author")?,
+                        commit_message: row.try_get("commit_message")?,
+                        commit_extra_info: row.try_get("commit_extra_info")?,
+                    })
+                })
+                .collect()
+        })
+    }
+
     fn get_table_head(&self, table_id: i64, snapshot_id: i64) -> Result<Option<i64>> {
         block_on(async {
             // Every catalog row of the table begins, and may end, at a snapshot that

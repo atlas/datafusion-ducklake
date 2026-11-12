@@ -2300,6 +2300,25 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         ))
     }
 
+    /// Every snapshot after `after` (every snapshot when `None`) that changed table
+    /// `table_id`, in snapshot order, each with its change-ledger entry: the one that
+    /// created it, changed its columns or dropped it, added or removed data or delete
+    /// files, or inserted or deleted inlined rows, flushed them or compacted its files.
+    /// A snapshot that only changed its sort or partition order, its comment or its tags,
+    /// changes no row it holds and is not listed.
+    ///
+    /// It is one read of the catalog, of the snapshots after `after` from the table's
+    /// creation on, so a caller that noted a snapshot reads only those since.
+    fn list_table_changes(
+        &self,
+        _table_id: i64,
+        _after: Option<i64>,
+    ) -> Result<Vec<SnapshotChangeMetadata>> {
+        Err(DuckLakeError::Unsupported(
+            "listing a table's changes is not supported by this backend".to_string(),
+        ))
+    }
+
     /// List schemas for a specific snapshot
     fn list_schemas(&self, snapshot_id: i64) -> Result<Vec<SchemaMetadata>>;
 

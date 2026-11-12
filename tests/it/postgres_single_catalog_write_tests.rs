@@ -1908,6 +1908,12 @@ async fn a_tables_changes_are_listed_with_their_commit_metadata_inlined_rows_inc
     ))
     .await;
     let flushed = ledger_only(format!("flushed_inlined:{table},inserted_into_table:999")).await;
+    // Compactions, as official records each, name the table they rewrote.
+    let compacted = ledger_only(format!("compacted_table:{table}")).await;
+    let merged = ledger_only(format!("merge_adjacent:{table}")).await;
+    let rewritten = ledger_only(format!("rewrite_delete:{table}")).await;
+    // Another table's id that begins with this one's names nothing of it.
+    ledger_only(format!("inserted_into_table:{table}0")).await;
     let files: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM ducklake_data_file WHERE table_id = $1 AND begin_snapshot = $2",
     )
@@ -1935,16 +1941,19 @@ async fn a_tables_changes_are_listed_with_their_commit_metadata_inlined_rows_inc
             (appended, Some("load:1".to_string())),
             (inlined, None),
             (flushed, None),
+            (compacted, None),
+            (merged, None),
+            (rewritten, None),
         ]
     );
     // After a snapshot, only the changes since.
-    assert_eq!(listed(Some(appended)), [(inlined, None), (flushed, None)]);
-    assert_eq!(listed(Some(flushed)), []);
+    assert_eq!(listed(Some(appended)).len(), 5);
+    assert_eq!(listed(Some(rewritten)), []);
 
     // Dropping it is a change of it too.
     assert!(writer.drop_table("main", "t").await.unwrap());
     let dropped = provider.get_current_snapshot().unwrap();
-    assert_eq!(listed(Some(flushed)), [(dropped, None)]);
+    assert_eq!(listed(Some(rewritten)), [(dropped, None)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

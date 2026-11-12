@@ -1509,6 +1509,8 @@ impl MetadataProvider for PostgresMetadataProvider {
                           AND snapshot_id >= (
                               SELECT MIN(begin_snapshot) FROM ducklake_table WHERE table_id = $1
                           )
+                          -- A cheap test first: only an entry naming the table's id is split.
+                          AND strpos(changes_made, ':' || $1) > 0
                           AND regexp_split_to_array(
                               changes_made, ',(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)'
                           ) && ARRAY[
@@ -1530,10 +1532,19 @@ impl MetadataProvider for PostgresMetadataProvider {
                         changes.commit_message,
                         changes.commit_extra_info
                  FROM changed
-                 LEFT JOIN ducklake_snapshot AS snapshot
-                   ON snapshot.snapshot_id = changed.snapshot_id
-                 LEFT JOIN ducklake_snapshot_changes AS changes
-                   ON changes.snapshot_id = changed.snapshot_id
+                 -- Each found by its key, one at a time (`LIMIT 1` keeps the planner from
+                 -- joining every snapshot): the changes are few, the lake's snapshots many.
+                 LEFT JOIN LATERAL (
+                     SELECT snapshot_time FROM ducklake_snapshot
+                     WHERE ducklake_snapshot.snapshot_id = changed.snapshot_id
+                     LIMIT 1
+                 ) AS snapshot ON TRUE
+                 LEFT JOIN LATERAL (
+                     SELECT changes_made, author, commit_message, commit_extra_info
+                     FROM ducklake_snapshot_changes
+                     WHERE ducklake_snapshot_changes.snapshot_id = changed.snapshot_id
+                     LIMIT 1
+                 ) AS changes ON TRUE
                  WHERE changed.snapshot_id > $2
                  ORDER BY changed.snapshot_id",
             )

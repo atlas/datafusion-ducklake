@@ -592,3 +592,39 @@ async fn duckdb_reads_our_deletes_and_updates() {
         .unwrap();
     assert_eq!(read, [(2, "B".into()), (3, "c".into()), (4, "d".into())]);
 }
+
+/// Deleting and updating rows writes delete files, which are changes of the table,
+/// listed with the snapshot that wrote each; the catalog finds them by its own index.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn deletes_and_updates_are_listed_as_changes_of_their_table() {
+    use datafusion_ducklake::MetadataProvider;
+
+    let (pool, _container) = database().await.unwrap();
+    let data = TempDir::new().unwrap();
+    seed(&pool, &data).await;
+    let seeded = head(&pool).await;
+    let ctx = session(&pool, &data).await;
+    affected(&ctx, "DELETE FROM lake.main.t WHERE id = 1").await;
+    let deleted = head(&pool).await;
+    affected(&ctx, "UPDATE lake.main.t SET name = 'B' WHERE id = 2").await;
+    let updated = head(&pool).await;
+    assert!(!delete_files(&pool).await.is_empty());
+
+    let table: i64 = sqlx::query_scalar(
+        "SELECT table_id FROM lake.ducklake_table WHERE table_name = 't' AND end_snapshot IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let listed = tokio::task::spawn_blocking({
+        let provider = provider(&pool);
+        move || provider.list_table_changes(table, Some(seeded)).unwrap()
+    })
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|change| change.snapshot_id)
+    .collect::<Vec<_>>();
+    assert_eq!(listed, [deleted, updated]);
+}

@@ -1488,55 +1488,54 @@ impl MetadataProvider for PostgresMetadataProvider {
         block_on(async {
             // A snapshot changed the table if a catalog row of it began or ended there, or
             // if its change-ledger entry names the table by a change to its rows: inlined
-            // rows and flushes leave no file row, and official names them only there. Its
-            // sort and partition rows, and `altered_table` alone, do not count.
+            // rows and flushes leave no file row, and are named only there. The entry is
+            // split on the commas outside quoted names, as `snapshot_change_tokens` splits
+            // it, so a quoted name cannot pose as a change of another table. Its sort and
+            // partition rows, and `altered_table` alone, do not count. A snapshot expired
+            // since is still listed, without its time or entry.
             let after = after.unwrap_or(-1);
             let rows = sqlx::query(
                 "WITH changed AS (
-                    SELECT begin_snapshot AS snapshot_id FROM ducklake_table
-                        WHERE table_id = $1 AND begin_snapshot > $2
-                    UNION SELECT end_snapshot FROM ducklake_table
-                        WHERE table_id = $1 AND end_snapshot > $2
-                    UNION SELECT begin_snapshot FROM ducklake_column
-                        WHERE table_id = $1 AND begin_snapshot > $2
-                    UNION SELECT end_snapshot FROM ducklake_column
-                        WHERE table_id = $1 AND end_snapshot > $2
-                    UNION SELECT begin_snapshot FROM ducklake_data_file
-                        WHERE table_id = $1 AND begin_snapshot > $2
-                    UNION SELECT end_snapshot FROM ducklake_data_file
-                        WHERE table_id = $1 AND end_snapshot > $2
-                    UNION SELECT begin_snapshot FROM ducklake_delete_file
-                        WHERE table_id = $1 AND begin_snapshot > $2
-                    UNION SELECT end_snapshot FROM ducklake_delete_file
-                        WHERE table_id = $1 AND end_snapshot > $2
+                    SELECT unnest(ARRAY[begin_snapshot, end_snapshot]) AS snapshot_id
+                        FROM ducklake_table WHERE table_id = $1
+                    UNION SELECT unnest(ARRAY[begin_snapshot, end_snapshot])
+                        FROM ducklake_column WHERE table_id = $1
+                    UNION SELECT unnest(ARRAY[begin_snapshot, end_snapshot])
+                        FROM ducklake_data_file WHERE table_id = $1
+                    UNION SELECT unnest(ARRAY[begin_snapshot, end_snapshot])
+                        FROM ducklake_delete_file WHERE table_id = $1
                     UNION SELECT snapshot_id FROM ducklake_snapshot_changes
                         WHERE snapshot_id > $2
                           AND snapshot_id >= (
                               SELECT MIN(begin_snapshot) FROM ducklake_table WHERE table_id = $1
                           )
-                          AND string_to_array(changes_made, ',') && ARRAY[
+                          AND regexp_split_to_array(
+                              changes_made, ',(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)'
+                          ) && ARRAY[
                               'inserted_into_table:' || $1,
                               'deleted_from_table:' || $1,
                               'inlined_insert:' || $1,
                               'inlined_delete:' || $1,
+                              'flushed_inlined:' || $1,
                               'inline_flush:' || $1,
                               'merge_adjacent:' || $1,
                               'rewrite_delete:' || $1,
-                              'compacted_table:' || $1,
-                              'dropped_table:' || $1
+                              'compacted_table:' || $1
                           ]::TEXT[]
                  )
-                 SELECT snapshot.snapshot_id,
+                 SELECT changed.snapshot_id,
                         snapshot.snapshot_time::text AS snapshot_time,
                         changes.changes_made,
                         changes.author,
                         changes.commit_message,
                         changes.commit_extra_info
                  FROM changed
-                 JOIN ducklake_snapshot AS snapshot ON snapshot.snapshot_id = changed.snapshot_id
+                 LEFT JOIN ducklake_snapshot AS snapshot
+                   ON snapshot.snapshot_id = changed.snapshot_id
                  LEFT JOIN ducklake_snapshot_changes AS changes
-                   ON changes.snapshot_id = snapshot.snapshot_id
-                 ORDER BY snapshot.snapshot_id",
+                   ON changes.snapshot_id = changed.snapshot_id
+                 WHERE changed.snapshot_id > $2
+                 ORDER BY changed.snapshot_id",
             )
             .bind(table_id)
             .bind(after)

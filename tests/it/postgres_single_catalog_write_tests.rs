@@ -1880,20 +1880,34 @@ async fn a_tables_changes_are_listed_with_their_commit_metadata_inlined_rows_inc
         .await
         .unwrap();
     let appended = transaction.commit().await.unwrap()[0].snapshot_id;
-    // Rows a participant inlined into the catalog, as official records them: a snapshot
-    // that names the table in its change ledger and adds no file. Written directly, as
-    // the inlined-data tests write official's encodings, since this writer writes files.
-    let inlined = writer.create_snapshot().unwrap();
-    sqlx::query(
-        "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
-         VALUES ($1, 'inserted_into_table:' || $2)
-         ON CONFLICT (snapshot_id) DO UPDATE SET changes_made = EXCLUDED.changes_made",
-    )
-    .bind(inlined)
-    .bind(table)
-    .execute(&pool)
-    .await
-    .unwrap();
+    // Changes a participant records in the change ledger alone, as official does: rows
+    // inlined into the catalog, then flushed, each adding no file of this writer's. Written
+    // directly, as the inlined-data tests write official's encodings, since this writer
+    // writes files. A quoted name holding what reads like this table's token changes
+    // nothing of it.
+    let ledger_only = |changes: String| {
+        let (writer, pool) = (&writer, &pool);
+        async move {
+            let snapshot = writer.create_snapshot().unwrap();
+            sqlx::query(
+                "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                 VALUES ($1, $2)
+                 ON CONFLICT (snapshot_id) DO UPDATE SET changes_made = EXCLUDED.changes_made",
+            )
+            .bind(snapshot)
+            .bind(changes)
+            .execute(pool)
+            .await
+            .unwrap();
+            snapshot
+        }
+    };
+    let inlined = ledger_only(format!("inlined_insert:{table}")).await;
+    ledger_only(format!(
+        r#"created_schema:"x,inserted_into_table:{table},y""#
+    ))
+    .await;
+    let flushed = ledger_only(format!("flushed_inlined:{table},inserted_into_table:999")).await;
     let files: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM ducklake_data_file WHERE table_id = $1 AND begin_snapshot = $2",
     )
@@ -1916,19 +1930,21 @@ async fn a_tables_changes_are_listed_with_their_commit_metadata_inlined_rows_inc
     assert!(sorted > created.snapshot_id && sorted < appended);
     assert_eq!(
         listed(None),
-        [(created.snapshot_id, None), (appended, Some("load:1".to_string())), (inlined, None),]
+        [
+            (created.snapshot_id, None),
+            (appended, Some("load:1".to_string())),
+            (inlined, None),
+            (flushed, None),
+        ]
     );
     // After a snapshot, only the changes since.
-    assert_eq!(
-        listed(Some(created.snapshot_id)),
-        [(appended, Some("load:1".to_string())), (inlined, None)]
-    );
-    assert_eq!(listed(Some(inlined)), []);
+    assert_eq!(listed(Some(appended)), [(inlined, None), (flushed, None)]);
+    assert_eq!(listed(Some(flushed)), []);
 
     // Dropping it is a change of it too.
     assert!(writer.drop_table("main", "t").await.unwrap());
     let dropped = provider.get_current_snapshot().unwrap();
-    assert_eq!(listed(Some(inlined)), [(dropped, None)]);
+    assert_eq!(listed(Some(flushed)), [(dropped, None)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

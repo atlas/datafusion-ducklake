@@ -2302,13 +2302,13 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
 
     /// Every snapshot after `after` (every snapshot when `None`) that changed table
     /// `table_id`, in snapshot order, each with its change-ledger entry: the one that
-    /// created it, changed its columns or dropped it, added or removed data or delete
-    /// files, or inserted or deleted inlined rows, flushed them or compacted its files.
-    /// A snapshot that only changed its sort or partition order, its comment or its tags,
-    /// changes no row it holds and is not listed.
+    /// created it, renamed it, changed a column of it or dropped it, added or removed data
+    /// or delete files, inserted or deleted inlined rows, flushed them or compacted its
+    /// files. A snapshot that only changed its sort or partition order, its comment or its
+    /// tags is not listed. A snapshot expired since is listed without its time or entry.
     ///
-    /// It is one read of the catalog, of the snapshots after `after` from the table's
-    /// creation on, so a caller that noted a snapshot reads only those since.
+    /// It is one read of the catalog, of the change ledger from the table's creation on
+    /// and after `after`, so a caller that noted a snapshot reads only those since.
     fn list_table_changes(
         &self,
         _table_id: i64,

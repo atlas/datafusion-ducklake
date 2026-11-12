@@ -476,6 +476,16 @@ pub struct SnapshotMetadata {
     pub schema_version: Option<i64>,
 }
 
+/// Which snapshots a catalog keeps, as [`MetadataProvider::snapshot_kept`]
+/// answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotKept {
+    /// The oldest snapshot the catalog keeps; `None` when it keeps none.
+    pub oldest: Option<i64>,
+    /// Whether it keeps the snapshot asked about.
+    pub kept: bool,
+}
+
 /// Change ledger entry associated with a DuckLake snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotChangeMetadata {
@@ -2247,6 +2257,20 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
 
     /// List all snapshots in the catalog
     fn list_snapshots(&self) -> Result<Vec<SnapshotMetadata>>;
+
+    /// The oldest snapshot the catalog still keeps, and whether it still keeps
+    /// `snapshot_id`: one read of the catalog's snapshots by their key, however
+    /// many it keeps.
+    ///
+    /// Expiring snapshots removes their rows from the catalog, so a snapshot
+    /// that is not kept cannot be read at: the files only it needed may be gone.
+    /// Expiry need not remove only the oldest, so a snapshot after the oldest
+    /// may be missing too.
+    fn snapshot_kept(&self, _snapshot_id: i64) -> Result<SnapshotKept> {
+        Err(DuckLakeError::Unsupported(
+            "telling which snapshots are kept is not supported by this backend".to_string(),
+        ))
+    }
 
     /// List snapshot change-ledger entries in snapshot order.
     fn list_snapshot_changes(&self) -> Result<Vec<SnapshotChangeMetadata>> {

@@ -347,6 +347,17 @@ const SQL_CREATE_TABLES: &[&str] = &[
         contains_nan BOOLEAN,
         extra_stats VARCHAR
     )"#,
+    // A table's changes (`MetadataProvider::list_table_changes`, `get_table_head`) are
+    // read by table, from each catalog table that records many rows of it; without these
+    // every read scans the whole lake's files. Each holds both snapshots, so a read of a
+    // table's changes needs no row of the table itself. `ducklake_table` is read by its
+    // key.
+    r#"CREATE INDEX IF NOT EXISTS idx_ducklake_column_changes
+        ON ducklake_column(table_id, begin_snapshot, end_snapshot)"#,
+    r#"CREATE INDEX IF NOT EXISTS idx_ducklake_data_file_changes
+        ON ducklake_data_file(table_id, begin_snapshot, end_snapshot)"#,
+    r#"CREATE INDEX IF NOT EXISTS idx_ducklake_delete_file_changes
+        ON ducklake_delete_file(table_id, begin_snapshot, end_snapshot)"#,
 ];
 
 /// Brings a catalog this writer created before DuckLake 1.0 up to it. Each

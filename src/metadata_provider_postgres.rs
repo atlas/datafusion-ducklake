@@ -1480,6 +1480,93 @@ impl MetadataProvider for PostgresMetadataProvider {
         })
     }
 
+    fn list_table_changes(
+        &self,
+        table_id: i64,
+        after: Option<i64>,
+    ) -> Result<Vec<SnapshotChangeMetadata>> {
+        block_on(async {
+            // A snapshot changed the table if a catalog row of it began or ended there, or
+            // if its change-ledger entry names the table by a change to its rows: inlined
+            // rows and flushes leave no file row, and are named only there. The entry is
+            // split on the commas outside quoted names, as `snapshot_change_tokens` splits
+            // it, so a quoted name cannot pose as a change of another table. Its sort and
+            // partition rows, and `altered_table` alone, do not count. A snapshot expired
+            // since is still listed, without its time or entry.
+            let after = after.unwrap_or(-1);
+            let rows = sqlx::query(
+                "WITH changed AS (
+                    SELECT unnest(ARRAY[begin_snapshot, end_snapshot]) AS snapshot_id
+                        FROM ducklake_table WHERE table_id = $1
+                    UNION SELECT unnest(ARRAY[begin_snapshot, end_snapshot])
+                        FROM ducklake_column WHERE table_id = $1
+                    UNION SELECT unnest(ARRAY[begin_snapshot, end_snapshot])
+                        FROM ducklake_data_file WHERE table_id = $1
+                    UNION SELECT unnest(ARRAY[begin_snapshot, end_snapshot])
+                        FROM ducklake_delete_file WHERE table_id = $1
+                    UNION SELECT snapshot_id FROM ducklake_snapshot_changes
+                        WHERE snapshot_id > $2
+                          AND snapshot_id >= (
+                              SELECT MIN(begin_snapshot) FROM ducklake_table WHERE table_id = $1
+                          )
+                          -- A cheap test first: only an entry naming the table's id is split.
+                          AND strpos(changes_made, ':' || $1) > 0
+                          AND regexp_split_to_array(
+                              changes_made, ',(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)'
+                          ) && ARRAY[
+                              'inserted_into_table:' || $1,
+                              'deleted_from_table:' || $1,
+                              'inlined_insert:' || $1,
+                              'inlined_delete:' || $1,
+                              'flushed_inlined:' || $1,
+                              'inline_flush:' || $1,
+                              'merge_adjacent:' || $1,
+                              'rewrite_delete:' || $1,
+                              'compacted_table:' || $1
+                          ]::TEXT[]
+                 )
+                 SELECT changed.snapshot_id,
+                        snapshot.snapshot_time::text AS snapshot_time,
+                        changes.changes_made,
+                        changes.author,
+                        changes.commit_message,
+                        changes.commit_extra_info
+                 FROM changed
+                 -- Each found by its key, one at a time (`LIMIT 1` keeps the planner from
+                 -- joining every snapshot): the changes are few, the lake's snapshots many.
+                 LEFT JOIN LATERAL (
+                     SELECT snapshot_time FROM ducklake_snapshot
+                     WHERE ducklake_snapshot.snapshot_id = changed.snapshot_id
+                     LIMIT 1
+                 ) AS snapshot ON TRUE
+                 LEFT JOIN LATERAL (
+                     SELECT changes_made, author, commit_message, commit_extra_info
+                     FROM ducklake_snapshot_changes
+                     WHERE ducklake_snapshot_changes.snapshot_id = changed.snapshot_id
+                     LIMIT 1
+                 ) AS changes ON TRUE
+                 WHERE changed.snapshot_id > $2
+                 ORDER BY changed.snapshot_id",
+            )
+            .bind(table_id)
+            .bind(after)
+            .fetch_all(&self.pool)
+            .await?;
+            rows.into_iter()
+                .map(|row| {
+                    Ok(SnapshotChangeMetadata {
+                        snapshot_id: row.try_get("snapshot_id")?,
+                        timestamp: row.try_get("snapshot_time")?,
+                        changes_made: row.try_get("changes_made")?,
+                        author: row.try_get("author")?,
+                        commit_message: row.try_get("commit_message")?,
+                        commit_extra_info: row.try_get("commit_extra_info")?,
+                    })
+                })
+                .collect()
+        })
+    }
+
     fn get_table_head(&self, table_id: i64, snapshot_id: i64) -> Result<Option<i64>> {
         block_on(async {
             // Every catalog row of the table begins, and may end, at a snapshot that

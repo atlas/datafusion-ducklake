@@ -148,6 +148,14 @@ impl MetadataProvider for OverlayBaseProvider {
         self.inner.get_table_head(table_id, snapshot_id)
     }
 
+    fn list_table_changes(
+        &self,
+        table_id: i64,
+        after: Option<i64>,
+    ) -> Result<Vec<SnapshotChangeMetadata>> {
+        self.inner.list_table_changes(table_id, after)
+    }
+
     fn list_schemas(&self, snapshot_id: i64) -> Result<Vec<SchemaMetadata>> {
         self.inner.list_schemas(snapshot_id)
     }

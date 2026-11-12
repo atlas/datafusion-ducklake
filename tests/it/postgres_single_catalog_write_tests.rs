@@ -1947,7 +1947,10 @@ async fn a_tables_changes_are_listed_with_their_commit_metadata_inlined_rows_inc
         ]
     );
     // After a snapshot, only the changes since.
-    assert_eq!(listed(Some(appended)).len(), 5);
+    assert_eq!(
+        listed(Some(appended)),
+        [(inlined, None), (flushed, None), (compacted, None), (merged, None), (rewritten, None),]
+    );
     assert_eq!(listed(Some(rewritten)), []);
 
     // Dropping it is a change of it too.

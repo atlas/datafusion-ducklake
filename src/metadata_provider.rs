@@ -509,8 +509,8 @@ pub struct SnapshotChangeMetadata {
 pub struct TableRowChange {
     /// The snapshot.
     pub snapshot_id: i64,
-    /// When it was committed; `None` for a snapshot expired since.
-    pub committed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When it was committed.
+    pub committed_at: chrono::DateTime<chrono::Utc>,
     /// Whether it inserted rows of the table, into files or inlined.
     pub inserted: bool,
     /// Whether it removed rows of the table: deleted them from files or inlined rows.
@@ -2387,7 +2387,7 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     /// one that only moves deletes removes nothing. A participant's inlined deletion that
     /// is named `deleted_from_table`, and that a later flush merged into a delete file
     /// beginning at an earlier deletion, leaves nothing beginning at its own snapshot, so
-    /// it is told as removing nothing. A snapshot expired since is listed without its time.
+    /// it is told as removing nothing. A snapshot expired since is left out.
     ///
     /// It is one read of the catalog's change ledger within the window, and one of the
     /// table's inlined deletions when an entry names deletes that left no file, both in one

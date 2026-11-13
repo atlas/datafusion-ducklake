@@ -1628,9 +1628,11 @@ impl MetadataProvider for PostgresMetadataProvider {
                         ) AS deleted_in_files,
                         named.deleted
                  FROM named
-                 LEFT JOIN LATERAL (
+                 -- A snapshot expired since is left out.
+                 JOIN LATERAL (
                      SELECT snapshot_time FROM ducklake_snapshot
                      WHERE ducklake_snapshot.snapshot_id = named.snapshot_id
+                       AND snapshot_time IS NOT NULL
                      LIMIT 1
                  ) AS snapshot ON TRUE
                  WHERE named.inserted OR named.inlined_deleted OR named.deleted
@@ -1646,16 +1648,13 @@ impl MetadataProvider for PostgresMetadataProvider {
             // moves them, which a flush's own entry names alike.
             let mut inlined = Vec::new();
             for row in rows {
-                let micros: Option<i64> = row.try_get("committed_micros")?;
-                let committed_at = micros
-                    .map(|micros| {
-                        chrono::DateTime::from_timestamp_micros(micros).ok_or_else(|| {
-                            crate::DuckLakeError::Internal(format!(
-                                "snapshot time out of range: {micros} microseconds"
-                            ))
-                        })
-                    })
-                    .transpose()?;
+                let micros: i64 = row.try_get("committed_micros")?;
+                let committed_at =
+                    chrono::DateTime::from_timestamp_micros(micros).ok_or_else(|| {
+                        crate::DuckLakeError::Internal(format!(
+                            "snapshot time out of range: {micros} microseconds"
+                        ))
+                    })?;
                 let snapshot_id: i64 = row.try_get("snapshot_id")?;
                 let deleted: bool = row.try_get("deleted")?;
                 let removed: bool = row.try_get::<bool, _>("inlined_deleted")?
@@ -1700,6 +1699,9 @@ impl MetadataProvider for PostgresMetadataProvider {
                 }
             }
             tx.commit().await?;
+            // A snapshot that named the table's rows but changed none, a flush that only
+            // moves deletes, is left out.
+            changes.retain(|change| change.inserted || change.removed);
             Ok(changes)
         })
     }

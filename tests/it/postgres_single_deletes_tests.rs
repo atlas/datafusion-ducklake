@@ -749,14 +749,12 @@ async fn a_flush_moving_deletes_removes_no_rows_and_a_delete_does() {
             (seeded, true, false),
             (deleted, false, true),
             (inlined, false, true),
-            // Its inlined deletes now sit in the flushed file, which begins before it.
             (inlined_later, false, true),
-            (flushed, false, false),
+            // The flush that moved them removed nothing, and is left out.
             (beside, false, true),
             (participant, false, true),
         ]
     );
-    assert!(listed.0.iter().all(|change| change.committed_at.is_some()));
     // Within a window, its ends included.
     assert_eq!(
         told(&listed.1),

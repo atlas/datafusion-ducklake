@@ -2390,7 +2390,8 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     /// it is told as removing nothing. A snapshot expired since is listed without its time.
     ///
     /// It is one read of the catalog's change ledger within the window, and one of the
-    /// table's inlined deletions when an entry names deletes that left no file.
+    /// table's inlined deletions when an entry names deletes that left no file, both in one
+    /// transaction that sees one snapshot of the catalog.
     fn list_table_row_changes(
         &self,
         _table_id: i64,

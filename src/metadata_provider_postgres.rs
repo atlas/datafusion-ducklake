@@ -1574,6 +1574,14 @@ impl MetadataProvider for PostgresMetadataProvider {
         through: Option<i64>,
     ) -> Result<Vec<crate::metadata_provider::TableRowChange>> {
         block_on(async {
+            // Both reads see one snapshot of the catalog, so a flush committed between them
+            // cannot move an inlined deletion out of the second's sight after the first.
+            let mut connection = self.pool.acquire().await?;
+            let mut tx = sqlx::Connection::begin_with(
+                &mut *connection,
+                "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY",
+            )
+            .await?;
             // The entries naming the table's rows within the window, split on the commas
             // outside quoted names as `snapshot_change_tokens` splits them, with whether the
             // catalog holds a removal of the table's rows that began at the snapshot: a delete
@@ -1631,7 +1639,7 @@ impl MetadataProvider for PostgresMetadataProvider {
             .bind(table_id)
             .bind(after.unwrap_or(-1))
             .bind(through)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
             let mut changes = Vec::with_capacity(rows.len());
             // Deletes from files that left no file, kept inlined in the catalog until a flush
@@ -1665,18 +1673,25 @@ impl MetadataProvider for PostgresMetadataProvider {
                 });
             }
             if !inlined.is_empty() {
-                let table = quote_ident(&inlined_delete_table_name(table_id)?);
-                let found: Vec<i64> = match sqlx::query_scalar(AssertSqlSafe(format!(
-                    "SELECT DISTINCT begin_snapshot FROM {table} WHERE begin_snapshot = ANY($1)"
-                )))
-                .bind(&inlined)
-                .fetch_all(&self.pool)
-                .await
-                {
-                    Ok(found) => found,
-                    // A table without inlined deletions has none.
-                    Err(error) if is_missing_statistics_table(&error) => Vec::new(),
-                    Err(error) => return Err(error.into()),
+                let name = inlined_delete_table_name(table_id)?;
+                let table = quote_ident(&name);
+                // A table without inlined deletions has none; asked first, since a failed
+                // statement would end the transaction.
+                let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+                    .bind(&table)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                let found: Vec<i64> = match exists {
+                    true => {
+                        sqlx::query_scalar(AssertSqlSafe(format!(
+                            "SELECT DISTINCT begin_snapshot FROM {table} \
+                             WHERE begin_snapshot = ANY($1)"
+                        )))
+                        .bind(&inlined)
+                        .fetch_all(&mut *tx)
+                        .await?
+                    },
+                    false => Vec::new(),
                 };
                 for change in &mut changes {
                     if found.contains(&change.snapshot_id) {
@@ -1684,6 +1699,7 @@ impl MetadataProvider for PostgresMetadataProvider {
                     }
                 }
             }
+            tx.commit().await?;
             Ok(changes)
         })
     }

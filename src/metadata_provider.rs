@@ -2272,6 +2272,21 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         ))
     }
 
+    /// The first run of snapshots from `first` up to `through` that the catalog no longer
+    /// keeps, as its first and last, or `None` when it keeps every one, `first` included:
+    /// read in one statement from the
+    /// snapshot table's key within the window alone, however many snapshots the catalog
+    /// keeps outside it. A gap between two kept snapshots is read as one expired: the
+    /// single-catalog writers number each snapshot one past the latest in the transaction
+    /// that commits it, so their IDs have no other gaps. An IDENTITY column, as the
+    /// multicatalog writer's, can skip the IDs of commits that rolled back, which this
+    /// reads as missing too.
+    fn first_snapshots_missing(&self, _first: i64, _through: i64) -> Result<Option<(i64, i64)>> {
+        Err(DuckLakeError::Unsupported(
+            "finding a snapshot missing in a window is not supported by this backend".to_string(),
+        ))
+    }
+
     /// List snapshot change-ledger entries in snapshot order.
     fn list_snapshot_changes(&self) -> Result<Vec<SnapshotChangeMetadata>> {
         Err(DuckLakeError::Unsupported(

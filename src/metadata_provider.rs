@@ -503,6 +503,20 @@ pub struct SnapshotChangeMetadata {
     pub commit_extra_info: Option<String>,
 }
 
+/// A snapshot that changed a table's rows, as [`MetadataProvider::list_table_row_changes`]
+/// tells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableRowChange {
+    /// The snapshot.
+    pub snapshot_id: i64,
+    /// When it was committed; `None` for a snapshot expired since.
+    pub committed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Whether it inserted rows of the table, into files or inlined.
+    pub inserted: bool,
+    /// Whether it removed rows of the table: deleted them from files or inlined rows.
+    pub removed: bool,
+}
+
 pub(crate) fn parse_snapshot_timestamp(raw: &str) -> Option<chrono::NaiveDateTime> {
     let mut timestamp = raw.trim();
     for suffix in ["Z", " UTC", "+00:00", "+00"] {
@@ -2355,6 +2369,36 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     ) -> Result<Vec<SnapshotChangeMetadata>> {
         Err(DuckLakeError::Unsupported(
             "listing a table's changes is not supported by this backend".to_string(),
+        ))
+    }
+
+    /// Every snapshot after `after` (every snapshot when `None`) and at or before `through`
+    /// (every later one when `None`) that inserted or removed rows of table `table_id`, in
+    /// snapshot order, with when it was committed and which it did.
+    ///
+    /// Inserts are told by the change ledger (`inserted_into_table`, `inlined_insert`),
+    /// which no flush or compaction writes, and so is deleting inlined rows
+    /// (`inlined_delete`). Deletes from files are told by the catalog's own rows, since a
+    /// flush that moves inlined deletes of file rows into delete files names them
+    /// `deleted_from_table` as a delete does: a snapshot whose entry names that removed rows
+    /// when a delete file of the table begins at it, a data file of the table ends at it, or
+    /// an inlined deletion of the table's file rows still kept in the catalog begins at it.
+    /// A flush writes its delete files from the snapshots that first deleted their rows, so
+    /// one that only moves deletes removes nothing. A participant's inlined deletion that
+    /// is named `deleted_from_table`, and that a later flush merged into a delete file
+    /// beginning at an earlier deletion, leaves nothing beginning at its own snapshot, so
+    /// it is told as removing nothing. A snapshot expired since is listed without its time.
+    ///
+    /// It is one read of the catalog's change ledger within the window, and one of the
+    /// table's inlined deletions when an entry names deletes that left no file.
+    fn list_table_row_changes(
+        &self,
+        _table_id: i64,
+        _after: Option<i64>,
+        _through: Option<i64>,
+    ) -> Result<Vec<TableRowChange>> {
+        Err(DuckLakeError::Unsupported(
+            "listing a table's row changes is not supported by this backend".to_string(),
         ))
     }
 

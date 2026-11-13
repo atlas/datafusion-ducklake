@@ -1567,6 +1567,127 @@ impl MetadataProvider for PostgresMetadataProvider {
         })
     }
 
+    fn list_table_row_changes(
+        &self,
+        table_id: i64,
+        after: Option<i64>,
+        through: Option<i64>,
+    ) -> Result<Vec<crate::metadata_provider::TableRowChange>> {
+        block_on(async {
+            // The entries naming the table's rows within the window, split on the commas
+            // outside quoted names as `snapshot_change_tokens` splits them, with whether the
+            // catalog holds a removal of the table's rows that began at the snapshot: a delete
+            // file, or a data file it ended. The time is read as microseconds since the epoch,
+            // which a `TIMESTAMP` the writer stores in UTC and a `TIMESTAMPTZ` both give,
+            // whatever the session's `DateStyle` or time zone.
+            let rows = sqlx::query(
+                "WITH entries AS (
+                    SELECT snapshot_id,
+                           regexp_split_to_array(
+                               changes_made, ',(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)'
+                           ) AS made
+                    FROM ducklake_snapshot_changes
+                    WHERE snapshot_id > $2
+                      AND ($3::BIGINT IS NULL OR snapshot_id <= $3)
+                      AND snapshot_id >= (
+                          SELECT MIN(begin_snapshot) FROM ducklake_table WHERE table_id = $1
+                      )
+                      -- A cheap test first: only an entry naming the table's id is split.
+                      AND strpos(changes_made, ':' || $1) > 0
+                 ),
+                 named AS (
+                    SELECT snapshot_id,
+                           made && ARRAY['inserted_into_table:' || $1, 'inlined_insert:' || $1]
+                               AS inserted,
+                           made && ARRAY['inlined_delete:' || $1] AS inlined_deleted,
+                           made && ARRAY['deleted_from_table:' || $1] AS deleted
+                    FROM entries
+                 )
+                 SELECT named.snapshot_id,
+                        (EXTRACT(EPOCH FROM snapshot.snapshot_time) * 1000000)::BIGINT
+                            AS committed_micros,
+                        named.inserted,
+                        named.inlined_deleted,
+                        named.deleted AND (
+                            EXISTS (
+                                SELECT 1 FROM ducklake_delete_file
+                                WHERE table_id = $1 AND begin_snapshot = named.snapshot_id
+                            )
+                            OR EXISTS (
+                                SELECT 1 FROM ducklake_data_file
+                                WHERE table_id = $1 AND end_snapshot = named.snapshot_id
+                            )
+                        ) AS deleted_in_files,
+                        named.deleted
+                 FROM named
+                 LEFT JOIN LATERAL (
+                     SELECT snapshot_time FROM ducklake_snapshot
+                     WHERE ducklake_snapshot.snapshot_id = named.snapshot_id
+                     LIMIT 1
+                 ) AS snapshot ON TRUE
+                 WHERE named.inserted OR named.inlined_deleted OR named.deleted
+                 ORDER BY named.snapshot_id",
+            )
+            .bind(table_id)
+            .bind(after.unwrap_or(-1))
+            .bind(through)
+            .fetch_all(&self.pool)
+            .await?;
+            let mut changes = Vec::with_capacity(rows.len());
+            // Deletes from files that left no file, kept inlined in the catalog until a flush
+            // moves them, which a flush's own entry names alike.
+            let mut inlined = Vec::new();
+            for row in rows {
+                let micros: Option<i64> = row.try_get("committed_micros")?;
+                let committed_at = micros
+                    .map(|micros| {
+                        chrono::DateTime::from_timestamp_micros(micros).ok_or_else(|| {
+                            crate::DuckLakeError::Internal(format!(
+                                "snapshot time out of range: {micros} microseconds"
+                            ))
+                        })
+                    })
+                    .transpose()?;
+                let snapshot_id: i64 = row.try_get("snapshot_id")?;
+                let deleted: bool = row.try_get("deleted")?;
+                let removed: bool = row.try_get::<bool, _>("inlined_deleted")?
+                    || row
+                        .try_get::<Option<bool>, _>("deleted_in_files")?
+                        .unwrap_or(false);
+                if deleted && !removed {
+                    inlined.push(snapshot_id);
+                }
+                changes.push(crate::metadata_provider::TableRowChange {
+                    snapshot_id,
+                    committed_at,
+                    inserted: row.try_get("inserted")?,
+                    removed,
+                });
+            }
+            if !inlined.is_empty() {
+                let table = quote_ident(&inlined_delete_table_name(table_id)?);
+                let found: Vec<i64> = match sqlx::query_scalar(AssertSqlSafe(format!(
+                    "SELECT DISTINCT begin_snapshot FROM {table} WHERE begin_snapshot = ANY($1)"
+                )))
+                .bind(&inlined)
+                .fetch_all(&self.pool)
+                .await
+                {
+                    Ok(found) => found,
+                    // A table without inlined deletions has none.
+                    Err(error) if is_missing_statistics_table(&error) => Vec::new(),
+                    Err(error) => return Err(error.into()),
+                };
+                for change in &mut changes {
+                    if found.contains(&change.snapshot_id) {
+                        change.removed = true;
+                    }
+                }
+            }
+            Ok(changes)
+        })
+    }
+
     fn get_table_head(&self, table_id: i64, snapshot_id: i64) -> Result<Option<i64>> {
         block_on(async {
             // Every catalog row of the table begins, and may end, at a snapshot that

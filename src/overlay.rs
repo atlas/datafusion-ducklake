@@ -133,8 +133,8 @@ impl MetadataProvider for OverlayBaseProvider {
         self.inner.snapshot_kept(snapshot_id)
     }
 
-    fn first_snapshot_missing(&self, first: i64, through: i64) -> Result<Option<i64>> {
-        self.inner.first_snapshot_missing(first, through)
+    fn first_snapshots_missing(&self, first: i64, through: i64) -> Result<Option<(i64, i64)>> {
+        self.inner.first_snapshots_missing(first, through)
     }
 
     fn list_snapshot_changes(&self) -> Result<Vec<SnapshotChangeMetadata>> {

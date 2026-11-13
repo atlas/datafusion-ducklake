@@ -1924,51 +1924,32 @@ async fn a_snapshot_missing_in_a_window_is_found_within_it() {
         );
     }
     let provider = PostgresMetadataProvider::new(&conn_str).await.unwrap();
-    let (first, through) = (written[0], written[3]);
-    assert_eq!(
-        provider.first_snapshot_missing(first, through).unwrap(),
-        None
-    );
-    assert_eq!(
-        provider.first_snapshot_missing(through, through).unwrap(),
-        None
-    );
+    let missing =
+        |first: i64, through: i64| provider.first_snapshots_missing(first, through).unwrap();
+    let expire = async |snapshot: i64| {
+        sqlx::query("DELETE FROM ducklake_snapshot WHERE snapshot_id = $1")
+            .bind(snapshot)
+            .execute(&pool)
+            .await
+            .unwrap();
+    };
+    let [w0, w1, w2, w3] = [written[0], written[1], written[2], written[3]];
+    assert_eq!(missing(w0, w3), None);
+    assert_eq!(missing(w3, w3), None);
 
     // One expired between kept ones is found, and nothing outside the window is.
-    sqlx::query("DELETE FROM ducklake_snapshot WHERE snapshot_id = $1")
-        .bind(written[1])
-        .execute(&pool)
-        .await
-        .unwrap();
-    assert_eq!(
-        provider.first_snapshot_missing(first, through).unwrap(),
-        Some(written[1])
-    );
-    assert_eq!(
-        provider
-            .first_snapshot_missing(written[2], through)
-            .unwrap(),
-        None
-    );
-    // The window's last missing too.
-    sqlx::query("DELETE FROM ducklake_snapshot WHERE snapshot_id = $1")
-        .bind(through)
-        .execute(&pool)
-        .await
-        .unwrap();
-    assert_eq!(
-        provider
-            .first_snapshot_missing(written[2], through)
-            .unwrap(),
-        Some(through)
-    );
-    // And the window's first.
-    assert_eq!(
-        provider
-            .first_snapshot_missing(written[1], written[2])
-            .unwrap(),
-        Some(written[1])
-    );
+    expire(w1).await;
+    assert_eq!(missing(w0, w3), Some((w1, w1)));
+    assert_eq!(missing(w2, w3), None);
+    // The window's first, up to the first kept.
+    assert_eq!(missing(w1, w3), Some((w1, w1)));
+    // The window's last.
+    expire(w3).await;
+    assert_eq!(missing(w2, w3), Some((w3, w3)));
+    // A run of them, through the window when none after it is kept.
+    expire(w2).await;
+    assert_eq!(missing(w0, w3), Some((w1, w3)));
+    assert_eq!(missing(w1, w3), Some((w1, w3)));
 }
 
 #[tokio::test(flavor = "multi_thread")]

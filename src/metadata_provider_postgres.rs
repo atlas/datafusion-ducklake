@@ -1664,33 +1664,43 @@ impl MetadataProvider for PostgresMetadataProvider {
         })
     }
 
-    fn first_snapshot_missing(&self, first: i64, through: i64) -> Result<Option<i64>> {
+    fn first_snapshots_missing(&self, first: i64, through: i64) -> Result<Option<(i64, i64)>> {
         block_on(async {
-            // One statement, so one read of the snapshot table: `first` when it is gone,
-            // else the first kept snapshot whose next is not one past it, which leaves a
-            // gap right after it.
+            // One statement, so one read of the snapshot table. A run from `first` when it
+            // is gone, up to the first kept or through the window; else the run after the
+            // first kept snapshot whose next is not one past it, up to that next or through
+            // the window.
             let row = sqlx::query(
                 "WITH kept AS (
                      SELECT snapshot_id,
                             lead(snapshot_id) OVER (ORDER BY snapshot_id) AS next
                      FROM ducklake_snapshot
                      WHERE snapshot_id >= $1 AND snapshot_id <= $2
+                 ),
+                 gap AS (
+                     SELECT kept.snapshot_id + 1 AS missing,
+                            COALESCE(kept.next - 1, $2) AS through
+                     FROM kept
+                     WHERE kept.snapshot_id < $2
+                       AND (kept.next IS NULL OR kept.next > kept.snapshot_id + 1)
+                     ORDER BY kept.snapshot_id
+                     LIMIT 1
                  )
-                 SELECT CASE
-                     WHEN NOT EXISTS (SELECT 1 FROM kept WHERE kept.snapshot_id = $1) THEN $1
-                     ELSE (
-                         SELECT min(kept.snapshot_id) + 1
-                         FROM kept
-                         WHERE kept.snapshot_id < $2
-                           AND (kept.next IS NULL OR kept.next > kept.snapshot_id + 1)
-                     )
-                 END",
+                 SELECT $1::bigint, COALESCE((SELECT min(kept.snapshot_id) - 1 FROM kept), $2)
+                 WHERE NOT EXISTS (SELECT 1 FROM kept WHERE kept.snapshot_id = $1)
+                 UNION ALL
+                 SELECT gap.missing, gap.through
+                 FROM gap
+                 WHERE EXISTS (SELECT 1 FROM kept WHERE kept.snapshot_id = $1)",
             )
             .bind(first)
             .bind(through)
-            .fetch_one(&self.pool)
+            .fetch_optional(&self.pool)
             .await?;
-            Ok(row.try_get(0)?)
+            Ok(match row {
+                Some(row) => Some((row.try_get(0)?, row.try_get(1)?)),
+                None => None,
+            })
         })
     }
 

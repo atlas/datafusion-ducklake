@@ -172,8 +172,8 @@ pub use catalog::DuckLakeCatalog;
 pub use error::{DuckLakeError, TypeChangeOperation, TypeChangeWriteMode};
 pub use metadata_provider::{
     ColumnTag, DuckLakeFileData, DuckLakeInlinedFileDeleteForFlush, DuckLakeInlinedFlushData,
-    DuckLakeTableFile, DuckLakeTag, MetadataProvider, ObjectTag, SnapshotChangeMetadata,
-    SnapshotKept, TableRowChange, TagObjectType, TagTarget,
+    DuckLakeTableFile, DuckLakeTag, MetadataProvider, ObjectTag, RowsRemoved,
+    SnapshotChangeMetadata, SnapshotKept, TableRowChange, TagObjectType, TagTarget,
 };
 pub use partition::{PartitionSpec, PartitionSpecColumn, PartitionTransform};
 pub use schema::DuckLakeSchema;

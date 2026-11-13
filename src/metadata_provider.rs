@@ -514,7 +514,22 @@ pub struct TableRowChange {
     /// Whether it inserted rows of the table, into files or inlined.
     pub inserted: bool,
     /// Whether it removed rows of the table: deleted them from files or inlined rows.
-    pub removed: bool,
+    pub removed: RowsRemoved,
+}
+
+/// Whether a snapshot removed rows of a table, as far as the catalog tells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowsRemoved {
+    /// It did: the catalog holds a removal that began at it.
+    Yes,
+    /// It did not.
+    No,
+    /// The catalog cannot tell: its entry names deletes from the table's files, as a delete
+    /// does and as a flush that moves inlined deletes into delete files does, and nothing
+    /// in the catalog begins at it. A delete into a data file that already has a delete
+    /// file rewrites that file from its earliest deletion, as such a flush does; only the
+    /// snapshot's own changes, read from the delete file's positions, tell which.
+    Unknown,
 }
 
 pub(crate) fn parse_snapshot_timestamp(raw: &str) -> Option<chrono::NaiveDateTime> {
@@ -2373,21 +2388,20 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     }
 
     /// Every snapshot after `after` (every snapshot when `None`) and at or before `through`
-    /// (every later one when `None`) that inserted or removed rows of table `table_id`, in
-    /// snapshot order, with when it was committed and which it did.
+    /// (every later one when `None`) that inserted rows of table `table_id` or may have
+    /// removed some, in snapshot order, with when it was committed and which it did.
     ///
     /// Inserts are told by the change ledger (`inserted_into_table`, `inlined_insert`),
     /// which no flush or compaction writes, and so is deleting inlined rows
-    /// (`inlined_delete`). Deletes from files are told by the catalog's own rows, since a
-    /// flush that moves inlined deletes of file rows into delete files names them
-    /// `deleted_from_table` as a delete does: a snapshot whose entry names that removed rows
-    /// when a delete file of the table begins at it, a data file of the table ends at it, or
-    /// an inlined deletion of the table's file rows still kept in the catalog begins at it.
-    /// A flush writes its delete files from the snapshots that first deleted their rows, so
-    /// one that only moves deletes removes nothing. A participant's inlined deletion that
-    /// is named `deleted_from_table`, and that a later flush merged into a delete file
-    /// beginning at an earlier deletion, leaves nothing beginning at its own snapshot, so
-    /// it is told as removing nothing. A snapshot expired since is left out.
+    /// (`inlined_delete`). Deletes from files (`deleted_from_table`) are told by the
+    /// catalog's own rows: [`RowsRemoved::Yes`] when a delete file of the table begins at
+    /// the snapshot, a data file of the table ends at it, or an inlined deletion of the
+    /// table's file rows still kept in the catalog begins at it; [`RowsRemoved::No`] when
+    /// none does and its entry names a flush of the table (`inline_flush`,
+    /// `flushed_inlined`), whose delete files begin at the snapshots that first deleted their
+    /// rows; [`RowsRemoved::Unknown`] otherwise, as a flush that only moves deletes and a
+    /// delete that rewrites a data file's delete file leave the same rows. A snapshot that
+    /// inserted nothing and removed nothing is left out, and so is one expired since.
     ///
     /// It is one read of the catalog's change ledger within the window, and one of the
     /// table's inlined deletions when an entry names deletes that left no file, both in one

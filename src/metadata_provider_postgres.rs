@@ -1608,7 +1608,9 @@ impl MetadataProvider for PostgresMetadataProvider {
                            made && ARRAY['inserted_into_table:' || $1, 'inlined_insert:' || $1]
                                AS inserted,
                            made && ARRAY['inlined_delete:' || $1] AS inlined_deleted,
-                           made && ARRAY['deleted_from_table:' || $1] AS deleted
+                           made && ARRAY['deleted_from_table:' || $1] AS deleted,
+                           made && ARRAY['inline_flush:' || $1, 'flushed_inlined:' || $1]
+                               AS flushed
                     FROM entries
                  )
                  SELECT named.snapshot_id,
@@ -1626,7 +1628,8 @@ impl MetadataProvider for PostgresMetadataProvider {
                                 WHERE table_id = $1 AND end_snapshot = named.snapshot_id
                             )
                         ) AS deleted_in_files,
-                        named.deleted
+                        named.deleted,
+                        named.flushed
                  FROM named
                  -- A snapshot expired since is left out.
                  JOIN LATERAL (
@@ -1657,13 +1660,25 @@ impl MetadataProvider for PostgresMetadataProvider {
                     })?;
                 let snapshot_id: i64 = row.try_get("snapshot_id")?;
                 let deleted: bool = row.try_get("deleted")?;
-                let removed: bool = row.try_get::<bool, _>("inlined_deleted")?
+                let flushed: bool = row.try_get("flushed")?;
+                let told = row.try_get::<bool, _>("inlined_deleted")?
                     || row
                         .try_get::<Option<bool>, _>("deleted_in_files")?
                         .unwrap_or(false);
-                if deleted && !removed {
-                    inlined.push(snapshot_id);
-                }
+                let removed = match (told, deleted, flushed) {
+                    (true, _, _) => crate::metadata_provider::RowsRemoved::Yes,
+                    (false, false, _) => crate::metadata_provider::RowsRemoved::No,
+                    // Told from the inlined deletions still kept, below, when one begins
+                    // here.
+                    (false, true, true) => {
+                        inlined.push(snapshot_id);
+                        crate::metadata_provider::RowsRemoved::No
+                    },
+                    (false, true, false) => {
+                        inlined.push(snapshot_id);
+                        crate::metadata_provider::RowsRemoved::Unknown
+                    },
+                };
                 changes.push(crate::metadata_provider::TableRowChange {
                     snapshot_id,
                     committed_at,
@@ -1694,14 +1709,15 @@ impl MetadataProvider for PostgresMetadataProvider {
                 };
                 for change in &mut changes {
                     if found.contains(&change.snapshot_id) {
-                        change.removed = true;
+                        change.removed = crate::metadata_provider::RowsRemoved::Yes;
                     }
                 }
             }
             tx.commit().await?;
-            // A snapshot that named the table's rows but changed none, a flush that only
-            // moves deletes, is left out.
-            changes.retain(|change| change.inserted || change.removed);
+            // A snapshot that named the table's rows but changed none, a flush, is left out.
+            changes.retain(|change| {
+                change.inserted || change.removed != crate::metadata_provider::RowsRemoved::No
+            });
             Ok(changes)
         })
     }

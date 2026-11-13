@@ -11,9 +11,9 @@ use crate::metadata_provider::{
     DuckLakeNameMapping, DuckLakeNameMappingEntry, DuckLakeStatistics, DuckLakeTableColumn,
     DuckLakeTableColumnStatistics, DuckLakeTableField, DuckLakeTableFile, DuckLakeTableStatistics,
     DuckLakeTag, FileWithTable, InlinedDataBackend, InlinedTableLayout, MetadataProvider,
-    MetadataSetting, ObjectTag, SchemaMetadata, SnapshotChangeMetadata, SnapshotMetadata,
-    TableMetadata, TableWithSchema, TagTarget, ViewMetadata, ViewWithSchema, block_on,
-    inlined_delete_table_name, inlined_text_projection, is_inlined_data_table,
+    MetadataSetting, ObjectTag, SchemaMetadata, SnapshotChangeMetadata, SnapshotKept,
+    SnapshotMetadata, TableMetadata, TableWithSchema, TagTarget, ViewMetadata, ViewWithSchema,
+    block_on, inlined_delete_table_name, inlined_text_projection, is_inlined_data_table,
     parse_inlined_rows_with_present, reconstruct_columns, reconstruct_columns_with_table,
     resolve_metadata_settings,
 };
@@ -1661,6 +1661,24 @@ impl MetadataProvider for PostgresMetadataProvider {
                     .collect::<Result<Vec<_>>>()?
             };
             resolve_metadata_settings(rows, schema_id, table_id)
+        })
+    }
+
+    fn snapshot_kept(&self, snapshot_id: i64) -> Result<SnapshotKept> {
+        block_on(async {
+            // Both by the snapshot table's key: the first entry of its index, and one
+            // lookup.
+            let row = sqlx::query(
+                "SELECT (SELECT snapshot_id FROM ducklake_snapshot ORDER BY snapshot_id LIMIT 1),
+                        EXISTS (SELECT 1 FROM ducklake_snapshot WHERE snapshot_id = $1)",
+            )
+            .bind(snapshot_id)
+            .fetch_one(&self.pool)
+            .await?;
+            Ok(SnapshotKept {
+                oldest: row.try_get(0)?,
+                kept: row.try_get(1)?,
+            })
         })
     }
 

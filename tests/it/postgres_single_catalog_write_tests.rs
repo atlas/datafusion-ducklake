@@ -1840,6 +1840,77 @@ async fn a_tables_head_moves_with_its_own_changes_only() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn the_snapshots_a_catalog_keeps_are_told_once_others_expire() {
+    use datafusion_ducklake::SnapshotKept;
+
+    let (writer, pool, conn_str, _tmp, _container) = setup().await.unwrap();
+    let tw = DuckLakeTableWriter::new(Arc::new(writer.clone()), object_store()).unwrap();
+    let oldest = tw
+        .write_table("main", "s", &[batch(vec![0], vec![None])])
+        .await
+        .unwrap()
+        .snapshot_id;
+    let created = tw
+        .write_table("main", "t", &[batch(vec![1], vec![Some("a")])])
+        .await
+        .unwrap()
+        .snapshot_id;
+    let appended = tw
+        .write_table("main", "u", &[batch(vec![2], vec![None])])
+        .await
+        .unwrap()
+        .snapshot_id;
+    let provider = PostgresMetadataProvider::new(&conn_str).await.unwrap();
+    let oldest: i64 = sqlx::query_scalar("SELECT min(snapshot_id) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .map(|first: i64| first.min(oldest))
+        .unwrap();
+    assert!(oldest < created);
+    assert_eq!(
+        provider.snapshot_kept(created).unwrap(),
+        SnapshotKept {
+            oldest: Some(oldest),
+            kept: true
+        }
+    );
+    assert!(!provider.snapshot_kept(appended + 1).unwrap().kept);
+
+    // Expiring removes a snapshot's row, the oldest or one after it.
+    sqlx::query("DELETE FROM ducklake_snapshot WHERE snapshot_id < $1")
+        .bind(created)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        provider.snapshot_kept(oldest).unwrap(),
+        SnapshotKept {
+            oldest: Some(created),
+            kept: false
+        }
+    );
+    sqlx::query("DELETE FROM ducklake_snapshot WHERE snapshot_id = $1")
+        .bind(created)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let after: i64 = sqlx::query_scalar("SELECT min(snapshot_id) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(after > created && after <= appended);
+    assert_eq!(
+        provider.snapshot_kept(created).unwrap(),
+        SnapshotKept {
+            oldest: Some(after),
+            kept: false
+        }
+    );
+    assert!(provider.snapshot_kept(appended).unwrap().kept);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn a_tables_changes_are_listed_with_their_commit_metadata_inlined_rows_included() {
     use datafusion_ducklake::{SnapshotCommitMetadata, TableWriteOptions};
 

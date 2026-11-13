@@ -22,7 +22,8 @@ use crate::metadata_provider::{
     DuckLakeFileMetadata, DuckLakeInlinedData, DuckLakeInlinedDelete, DuckLakeNameMapping,
     DuckLakeStatistics, DuckLakeTableColumn, DuckLakeTableField, DuckLakeTableFile, DuckLakeTag,
     FileWithTable, MetadataProvider, ObjectTag, SchemaMetadata, SnapshotChangeMetadata,
-    SnapshotMetadata, TableMetadata, TableWithSchema, TagTarget, ViewMetadata, ViewWithSchema,
+    SnapshotKept, SnapshotMetadata, TableMetadata, TableWithSchema, TagTarget, ViewMetadata,
+    ViewWithSchema,
 };
 use crate::table::DuckLakeTable;
 use crate::{DuckLakeError, Result};
@@ -126,6 +127,10 @@ impl MetadataProvider for OverlayBaseProvider {
 
     fn list_snapshots(&self) -> Result<Vec<SnapshotMetadata>> {
         self.inner.list_snapshots()
+    }
+
+    fn snapshot_kept(&self, snapshot_id: i64) -> Result<SnapshotKept> {
+        self.inner.snapshot_kept(snapshot_id)
     }
 
     fn list_snapshot_changes(&self) -> Result<Vec<SnapshotChangeMetadata>> {

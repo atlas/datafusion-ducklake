@@ -1962,6 +1962,13 @@ async fn a_snapshot_missing_in_a_window_is_found_within_it() {
             .unwrap(),
         Some(through)
     );
+    // And the window's first.
+    assert_eq!(
+        provider
+            .first_snapshot_missing(written[1], written[2])
+            .unwrap(),
+        Some(written[1])
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

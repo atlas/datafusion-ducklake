@@ -2272,12 +2272,11 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         ))
     }
 
-    /// The first snapshot after `first` up to `through` that the catalog no longer keeps,
-    /// or `None` when it keeps every one: read from the snapshot table's key within the
-    /// window alone, however many snapshots the catalog keeps outside it. Snapshot IDs are
-    /// consecutive, as every writer numbers its snapshot one past the latest, so a gap
-    /// between two kept snapshots is one expired. `first` itself is the caller's to check
-    /// ([`Self::snapshot_kept`]).
+    /// The first snapshot from `first` up to `through` that the catalog no longer keeps,
+    /// or `None` when it keeps every one, `first` included: read in one statement from the
+    /// snapshot table's key within the window alone, however many snapshots the catalog
+    /// keeps outside it. Snapshot IDs are consecutive, as every writer numbers its snapshot
+    /// one past the latest, so a gap between two kept snapshots is one expired.
     fn first_snapshot_missing(&self, _first: i64, _through: i64) -> Result<Option<i64>> {
         Err(DuckLakeError::Unsupported(
             "finding a snapshot missing in a window is not supported by this backend".to_string(),

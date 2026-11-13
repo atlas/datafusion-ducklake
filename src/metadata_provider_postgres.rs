@@ -1666,18 +1666,25 @@ impl MetadataProvider for PostgresMetadataProvider {
 
     fn first_snapshot_missing(&self, first: i64, through: i64) -> Result<Option<i64>> {
         block_on(async {
-            // Each kept snapshot in the window with the next one kept after it; the first
-            // whose next is not one past it leaves a gap right after it.
+            // One statement, so one read of the snapshot table: `first` when it is gone,
+            // else the first kept snapshot whose next is not one past it, which leaves a
+            // gap right after it.
             let row = sqlx::query(
-                "SELECT min(kept.snapshot_id) + 1
-                 FROM (
+                "WITH kept AS (
                      SELECT snapshot_id,
                             lead(snapshot_id) OVER (ORDER BY snapshot_id) AS next
                      FROM ducklake_snapshot
                      WHERE snapshot_id >= $1 AND snapshot_id <= $2
-                 ) AS kept
-                 WHERE kept.snapshot_id < $2
-                   AND (kept.next IS NULL OR kept.next > kept.snapshot_id + 1)",
+                 )
+                 SELECT CASE
+                     WHEN NOT EXISTS (SELECT 1 FROM kept WHERE kept.snapshot_id = $1) THEN $1
+                     ELSE (
+                         SELECT min(kept.snapshot_id) + 1
+                         FROM kept
+                         WHERE kept.snapshot_id < $2
+                           AND (kept.next IS NULL OR kept.next > kept.snapshot_id + 1)
+                     )
+                 END",
             )
             .bind(first)
             .bind(through)

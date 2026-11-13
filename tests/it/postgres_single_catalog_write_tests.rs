@@ -1911,6 +1911,61 @@ async fn the_snapshots_a_catalog_keeps_are_told_once_others_expire() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_snapshot_missing_in_a_window_is_found_within_it() {
+    let (writer, pool, conn_str, _tmp, _container) = setup().await.unwrap();
+    let tw = DuckLakeTableWriter::new(Arc::new(writer.clone()), object_store()).unwrap();
+    let mut written = Vec::new();
+    for (index, name) in ["a", "b", "c", "d"].into_iter().enumerate() {
+        written.push(
+            tw.write_table("main", name, &[batch(vec![index as i64], vec![None])])
+                .await
+                .unwrap()
+                .snapshot_id,
+        );
+    }
+    let provider = PostgresMetadataProvider::new(&conn_str).await.unwrap();
+    let (first, through) = (written[0], written[3]);
+    assert_eq!(
+        provider.first_snapshot_missing(first, through).unwrap(),
+        None
+    );
+    assert_eq!(
+        provider.first_snapshot_missing(through, through).unwrap(),
+        None
+    );
+
+    // One expired between kept ones is found, and nothing outside the window is.
+    sqlx::query("DELETE FROM ducklake_snapshot WHERE snapshot_id = $1")
+        .bind(written[1])
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        provider.first_snapshot_missing(first, through).unwrap(),
+        Some(written[1])
+    );
+    assert_eq!(
+        provider
+            .first_snapshot_missing(written[2], through)
+            .unwrap(),
+        None
+    );
+    // The window's last missing too.
+    sqlx::query("DELETE FROM ducklake_snapshot WHERE snapshot_id = $1")
+        .bind(through)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        provider
+            .first_snapshot_missing(written[2], through)
+            .unwrap(),
+        Some(through)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn a_tables_changes_are_listed_with_their_commit_metadata_inlined_rows_included() {
     use datafusion_ducklake::{SnapshotCommitMetadata, TableWriteOptions};
 

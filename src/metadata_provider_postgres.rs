@@ -1664,6 +1664,29 @@ impl MetadataProvider for PostgresMetadataProvider {
         })
     }
 
+    fn first_snapshot_missing(&self, first: i64, through: i64) -> Result<Option<i64>> {
+        block_on(async {
+            // Each kept snapshot in the window with the next one kept after it; the first
+            // whose next is not one past it leaves a gap right after it.
+            let row = sqlx::query(
+                "SELECT min(kept.snapshot_id) + 1
+                 FROM (
+                     SELECT snapshot_id,
+                            lead(snapshot_id) OVER (ORDER BY snapshot_id) AS next
+                     FROM ducklake_snapshot
+                     WHERE snapshot_id >= $1 AND snapshot_id <= $2
+                 ) AS kept
+                 WHERE kept.snapshot_id < $2
+                   AND (kept.next IS NULL OR kept.next > kept.snapshot_id + 1)",
+            )
+            .bind(first)
+            .bind(through)
+            .fetch_one(&self.pool)
+            .await?;
+            Ok(row.try_get(0)?)
+        })
+    }
+
     fn snapshot_kept(&self, snapshot_id: i64) -> Result<SnapshotKept> {
         block_on(async {
             // Both by the snapshot table's key: the first entry of its index, and one

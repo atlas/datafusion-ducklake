@@ -802,8 +802,9 @@ async fn a_flush_moving_deletes_removes_no_rows_and_a_delete_does() {
             (inlined_later, false, Yes),
             // The flush that moved them leaves the same rows as the rewrite.
             (flushed, false, Unknown),
-            // The flush that wrote rows and replaced a delete file removed none, and is left
-            // out.
+            // A flush that names itself may share its snapshot with a delete: only its
+            // changes tell.
+            (flushed_rows, false, Unknown),
             (beside, false, Yes),
             (participant, false, Yes),
         ]

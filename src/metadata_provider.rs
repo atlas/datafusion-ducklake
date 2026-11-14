@@ -522,11 +522,12 @@ pub struct TableRowChange {
 pub enum RowsRemoved {
     /// It did: the catalog holds a removal that began at it.
     Yes,
-    /// It did not.
+    /// It did not: it names no delete of the table.
     No,
     /// The catalog cannot tell: its entry names deletes from the table's files, as a delete
-    /// does and as a flush that moves inlined deletes into delete files does, and nothing
-    /// in the catalog begins at it. A delete into a data file that already has a delete
+    /// does and as a flush that moves inlined deletes into delete files does, beside a flush
+    /// or not, since one transaction may hold both, and nothing in the catalog begins at
+    /// it. A delete into a data file that already has a delete
     /// file rewrites that file from its earliest deletion, as such a flush does; only the
     /// snapshot's own changes, read from the delete file's positions, tell which.
     Unknown,
@@ -2396,11 +2397,11 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     /// (`inlined_delete`). Deletes from files (`deleted_from_table`) are told by the
     /// catalog's own rows: [`RowsRemoved::Yes`] when a delete file of the table begins at
     /// the snapshot, a data file of the table ends at it, or an inlined deletion of the
-    /// table's file rows still kept in the catalog begins at it; [`RowsRemoved::No`] when
-    /// none does and its entry names a flush of the table (`inline_flush`,
-    /// `flushed_inlined`), whose delete files begin at the snapshots that first deleted their
-    /// rows; [`RowsRemoved::Unknown`] otherwise, as a flush that only moves deletes and a
-    /// delete that rewrites a data file's delete file leave the same rows. A snapshot that
+    /// table's file rows still kept in the catalog begins at it; [`RowsRemoved::Unknown`]
+    /// otherwise, as a flush, whose delete files begin at the snapshots that first deleted
+    /// their rows, and a delete that rewrites a data file's delete file leave the same rows,
+    /// and one transaction may hold both. [`RowsRemoved::No`] is for a snapshot that names
+    /// no delete of the table. A snapshot that
     /// inserted nothing and removed nothing is left out, and so is one expired since.
     ///
     /// It is one read of the catalog's change ledger within the window, and one of the

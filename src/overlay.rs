@@ -170,8 +170,10 @@ impl MetadataProvider for OverlayBaseProvider {
         table_id: i64,
         after: Option<i64>,
         through: Option<i64>,
+        limit: Option<usize>,
     ) -> Result<Vec<crate::metadata_provider::TableRowChange>> {
-        self.inner.list_table_row_changes(table_id, after, through)
+        self.inner
+            .list_table_row_changes(table_id, after, through, limit)
     }
 
     fn list_schemas(&self, snapshot_id: i64) -> Result<Vec<SchemaMetadata>> {

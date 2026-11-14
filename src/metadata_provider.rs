@@ -2390,7 +2390,8 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
 
     /// Every snapshot after `after` (every snapshot when `None`) and at or before `through`
     /// (every later one when `None`) that inserted rows of table `table_id` or may have
-    /// removed some, in snapshot order, with when it was committed and which it did.
+    /// removed some, with when it was committed and which it did: the newest `limit` of them
+    /// when given, read newest first from `through`, and given in snapshot order.
     ///
     /// Inserts are told by the change ledger (`inserted_into_table`, `inlined_insert`),
     /// which no flush or compaction writes, and so is deleting inlined rows
@@ -2412,6 +2413,7 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         _table_id: i64,
         _after: Option<i64>,
         _through: Option<i64>,
+        _limit: Option<usize>,
     ) -> Result<Vec<TableRowChange>> {
         Err(DuckLakeError::Unsupported(
             "listing a table's row changes is not supported by this backend".to_string(),

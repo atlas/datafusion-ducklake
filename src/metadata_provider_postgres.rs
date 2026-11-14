@@ -1572,7 +1572,11 @@ impl MetadataProvider for PostgresMetadataProvider {
         table_id: i64,
         after: Option<i64>,
         through: Option<i64>,
+        limit: Option<usize>,
     ) -> Result<Vec<crate::metadata_provider::TableRowChange>> {
+        let limit = limit.map(i64::try_from).transpose().map_err(|error| {
+            crate::DuckLakeError::InvalidConfig(format!("a limit past i64: {error}"))
+        })?;
         block_on(async {
             // Both reads see one snapshot of the catalog, so a flush committed between them
             // cannot move an inlined deletion out of the second's sight after the first.
@@ -1636,11 +1640,14 @@ impl MetadataProvider for PostgresMetadataProvider {
                      LIMIT 1
                  ) AS snapshot ON TRUE
                  WHERE named.inserted OR named.inlined_deleted OR named.deleted
-                 ORDER BY named.snapshot_id",
+                 -- Newest first from `through`, as far as the limit reaches.
+                 ORDER BY named.snapshot_id DESC
+                 LIMIT $4",
             )
             .bind(table_id)
             .bind(after.unwrap_or(-1))
             .bind(through)
+            .bind(limit)
             .fetch_all(&mut *tx)
             .await?;
             let mut changes = Vec::with_capacity(rows.len());
@@ -1708,6 +1715,7 @@ impl MetadataProvider for PostgresMetadataProvider {
             }
             tx.commit().await?;
             // A snapshot that named the table's rows but changed none, a flush, is left out.
+            changes.reverse();
             changes.retain(|change| {
                 change.inserted || change.removed != crate::metadata_provider::RowsRemoved::No
             });

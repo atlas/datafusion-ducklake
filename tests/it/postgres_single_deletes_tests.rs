@@ -774,9 +774,14 @@ async fn a_flush_moving_deletes_removes_no_rows_and_a_delete_does() {
     let provider = provider(&pool);
     let listed = tokio::task::spawn_blocking(move || {
         (
-            provider.list_table_row_changes(table, None, None).unwrap(),
             provider
-                .list_table_row_changes(table, Some(seeded), Some(inlined))
+                .list_table_row_changes(table, None, None, None)
+                .unwrap(),
+            provider
+                .list_table_row_changes(table, Some(seeded), Some(inlined), None)
+                .unwrap(),
+            provider
+                .list_table_row_changes(table, Some(seeded), Some(inlined), Some(2))
                 .unwrap(),
         )
     })
@@ -819,5 +824,10 @@ async fn a_flush_moving_deletes_removes_no_rows_and_a_delete_does() {
             (deleted_six, false, Yes),
             (inlined, false, Yes),
         ]
+    );
+    // The newest of them as far as a limit reaches, still in snapshot order.
+    assert_eq!(
+        told(&listed.2),
+        [(deleted_six, false, Yes), (inlined, false, Yes)]
     );
 }

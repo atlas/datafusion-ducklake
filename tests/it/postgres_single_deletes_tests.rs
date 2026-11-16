@@ -628,3 +628,206 @@ async fn deletes_and_updates_are_listed_as_changes_of_their_table() {
     .collect::<Vec<_>>();
     assert_eq!(listed, [deleted, updated]);
 }
+
+/// A table's row changes say which snapshots removed rows from what the catalog keeps, not
+/// from the change ledger alone: a flush that moves inlined deletes of file rows into delete
+/// files names them `deleted_from_table` as a delete does, and a delete into a data file
+/// that already has a delete file rewrites it from its earliest deletion, as such a flush
+/// does, so the catalog cannot tell those two apart.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_flush_moving_deletes_removes_no_rows_and_a_delete_does() {
+    use datafusion_ducklake::{MetadataProvider, RowsRemoved};
+
+    let (pool, _container) = database().await.unwrap();
+    let data = TempDir::new().unwrap();
+    seed(&pool, &data).await;
+    let seeded = head(&pool).await;
+    let table: i64 = sqlx::query_scalar(
+        "SELECT table_id FROM lake.ducklake_table WHERE table_name = 't' AND end_snapshot IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let writer = writer(&pool, &data).await;
+    let catalog =
+        Arc::new(DuckLakeCatalog::with_writer(Arc::new(provider(&pool)), writer.clone()).unwrap());
+    let ctx = SessionContext::new();
+    ctx.register_catalog("lake", catalog.clone());
+    let entry = async |snapshot: i64| -> String {
+        sqlx::query_scalar(
+            "SELECT changes_made FROM lake.ducklake_snapshot_changes WHERE snapshot_id = $1",
+        )
+        .bind(snapshot)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    let inlining = async |limit: &'static str| {
+        let writer = writer.clone();
+        tokio::task::spawn_blocking(move || {
+            writer
+                .set_global_setting("data_inlining_row_limit", limit)
+                .unwrap()
+        })
+        .await
+        .unwrap();
+    };
+    // A delete into a delete file, and a second delete into the same data file, which
+    // rewrites its delete file from the first.
+    affected(&ctx, "DELETE FROM lake.main.t WHERE id = 1").await;
+    let deleted = head(&pool).await;
+    affected(&ctx, "DELETE FROM lake.main.t WHERE id = 4").await;
+    let rewritten = head(&pool).await;
+    assert_eq!(
+        entry(rewritten).await,
+        format!("deleted_from_table:{table}")
+    );
+    // Rows in a second file, one of them deleted into a delete file of its own.
+    ctx.sql("INSERT INTO lake.main.t VALUES (5, 'e'), (6, 'f')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let appended = head(&pool).await;
+    affected(&ctx, "DELETE FROM lake.main.t WHERE id = 6").await;
+    let deleted_six = head(&pool).await;
+    // Deletes kept inlined in the catalog, then flushed into the first file's delete file,
+    // which they replace from the first deletion: the flush's entry names its deletes alone.
+    inlining("10").await;
+    affected(&ctx, "DELETE FROM lake.main.t WHERE id = 2").await;
+    let inlined = head(&pool).await;
+    affected(&ctx, "DELETE FROM lake.main.t WHERE id = 3").await;
+    let inlined_later = head(&pool).await;
+    catalog
+        .flush_inlined_data(&ctx.state(), None, None)
+        .await
+        .unwrap();
+    let flushed = head(&pool).await;
+    assert_eq!(entry(flushed).await, format!("deleted_from_table:{table}"));
+    // A flush that also writes inlined rows to files, as DuckDB's or this crate's records
+    // one: its entry names the flush beside the deletes it moved, and it replaces the
+    // second file's delete file with one beginning at that file's first deletion.
+    let flushed_rows = tokio::task::spawn_blocking({
+        let writer = writer.clone();
+        move || writer.create_snapshot().unwrap()
+    })
+    .await
+    .unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO lake.ducklake_snapshot_changes (snapshot_id, changes_made)
+             VALUES ({flushed_rows}, 'deleted_from_table:{table},inline_flush:{table}')
+             ON CONFLICT (snapshot_id) DO UPDATE SET changes_made = EXCLUDED.changes_made;
+         CREATE TEMP TABLE replaced AS
+             SELECT * FROM lake.ducklake_delete_file
+             WHERE table_id = {table} AND begin_snapshot = {deleted_six};
+         DELETE FROM lake.ducklake_delete_file
+             WHERE table_id = {table} AND begin_snapshot = {deleted_six};
+         UPDATE replaced SET delete_file_id = delete_file_id + 2000000;
+         INSERT INTO lake.ducklake_delete_file SELECT * FROM replaced;"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    // A delete beside a flush in one snapshot, as another writer may commit them: its
+    // delete file begins there.
+    let beside = tokio::task::spawn_blocking({
+        let writer = writer.clone();
+        move || writer.create_snapshot().unwrap()
+    })
+    .await
+    .unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO lake.ducklake_snapshot_changes (snapshot_id, changes_made)
+             VALUES ({beside}, 'deleted_from_table:{table},inline_flush:{table}')
+             ON CONFLICT (snapshot_id) DO UPDATE SET changes_made = EXCLUDED.changes_made;
+         CREATE TEMP TABLE copied AS
+             SELECT * FROM lake.ducklake_delete_file WHERE table_id = {table} LIMIT 1;
+         UPDATE copied SET delete_file_id = delete_file_id + 1000000,
+             begin_snapshot = {beside}, end_snapshot = NULL;
+         INSERT INTO lake.ducklake_delete_file SELECT * FROM copied;"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    // A participant's deletion of a file row kept inlined, as DuckDB records it: named a
+    // delete from the table, with its inlined deletion beginning there.
+    let participant = tokio::task::spawn_blocking({
+        let writer = writer.clone();
+        move || writer.create_snapshot().unwrap()
+    })
+    .await
+    .unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO lake.ducklake_snapshot_changes (snapshot_id, changes_made)
+             VALUES ({participant}, 'deleted_from_table:{table}')
+             ON CONFLICT (snapshot_id) DO UPDATE SET changes_made = EXCLUDED.changes_made;
+         CREATE TABLE IF NOT EXISTS lake.ducklake_inlined_delete_{table}
+             (file_id BIGINT, row_id BIGINT, begin_snapshot BIGINT);
+         INSERT INTO lake.ducklake_inlined_delete_{table} VALUES (1, 3, {participant});"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let provider = provider(&pool);
+    let listed = tokio::task::spawn_blocking(move || {
+        (
+            provider
+                .list_table_row_changes(table, None, None, None)
+                .unwrap(),
+            provider
+                .list_table_row_changes(table, Some(seeded), Some(inlined), None)
+                .unwrap(),
+            provider
+                .list_table_row_changes(table, Some(seeded), Some(inlined), Some(2))
+                .unwrap(),
+        )
+    })
+    .await
+    .unwrap();
+    let told = |changes: &[datafusion_ducklake::TableRowChange]| {
+        changes
+            .iter()
+            .map(|change| (change.snapshot_id, change.inserted, change.removed))
+            .collect::<Vec<_>>()
+    };
+    use RowsRemoved::{No, Unknown, Yes};
+    assert_eq!(
+        told(&listed.0),
+        [
+            (seeded, true, No),
+            (deleted, false, Yes),
+            // Rewritten from the first delete, as a flush rewrites: only its changes tell.
+            (rewritten, false, Unknown),
+            (appended, true, No),
+            (deleted_six, false, Yes),
+            (inlined, false, Yes),
+            (inlined_later, false, Yes),
+            // The flush that moved them leaves the same rows as the rewrite.
+            (flushed, false, Unknown),
+            // A flush that names itself may share its snapshot with a delete: only its
+            // changes tell.
+            (flushed_rows, false, Unknown),
+            (beside, false, Yes),
+            (participant, false, Yes),
+        ]
+    );
+    // Within a window, its ends included.
+    assert_eq!(
+        told(&listed.1),
+        [
+            (deleted, false, Yes),
+            (rewritten, false, Unknown),
+            (appended, true, No),
+            (deleted_six, false, Yes),
+            (inlined, false, Yes),
+        ]
+    );
+    // The newest of them as far as a limit reaches, still in snapshot order.
+    assert_eq!(
+        told(&listed.2),
+        [(deleted_six, false, Yes), (inlined, false, Yes)]
+    );
+}

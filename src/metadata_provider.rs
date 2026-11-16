@@ -503,6 +503,36 @@ pub struct SnapshotChangeMetadata {
     pub commit_extra_info: Option<String>,
 }
 
+/// A snapshot that changed a table's rows, as [`MetadataProvider::list_table_row_changes`]
+/// tells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableRowChange {
+    /// The snapshot.
+    pub snapshot_id: i64,
+    /// When it was committed.
+    pub committed_at: chrono::DateTime<chrono::Utc>,
+    /// Whether it inserted rows of the table, into files or inlined.
+    pub inserted: bool,
+    /// Whether it removed rows of the table: deleted them from files or inlined rows.
+    pub removed: RowsRemoved,
+}
+
+/// Whether a snapshot removed rows of a table, as far as the catalog tells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowsRemoved {
+    /// It did: the catalog holds a removal that began at it.
+    Yes,
+    /// It did not: it names no delete of the table.
+    No,
+    /// The catalog cannot tell: its entry names deletes from the table's files, as a delete
+    /// does and as a flush that moves inlined deletes into delete files does, beside a flush
+    /// or not, since one transaction may hold both, and nothing in the catalog begins at
+    /// it. A delete into a data file that already has a delete
+    /// file rewrites that file from its earliest deletion, as such a flush does; only the
+    /// snapshot's own changes, read from the delete file's positions, tell which.
+    Unknown,
+}
+
 pub(crate) fn parse_snapshot_timestamp(raw: &str) -> Option<chrono::NaiveDateTime> {
     let mut timestamp = raw.trim();
     for suffix in ["Z", " UTC", "+00:00", "+00"] {
@@ -2355,6 +2385,38 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     ) -> Result<Vec<SnapshotChangeMetadata>> {
         Err(DuckLakeError::Unsupported(
             "listing a table's changes is not supported by this backend".to_string(),
+        ))
+    }
+
+    /// Every snapshot after `after` (every snapshot when `None`) and at or before `through`
+    /// (every later one when `None`) that inserted rows of table `table_id` or may have
+    /// removed some, with when it was committed and which it did: the newest `limit` of them
+    /// when given, read newest first from `through`, and given in snapshot order.
+    ///
+    /// Inserts are told by the change ledger (`inserted_into_table`, `inlined_insert`),
+    /// which no flush or compaction writes, and so is deleting inlined rows
+    /// (`inlined_delete`). Deletes from files (`deleted_from_table`) are told by the
+    /// catalog's own rows: [`RowsRemoved::Yes`] when a delete file of the table begins at
+    /// the snapshot, a data file of the table ends at it, or an inlined deletion of the
+    /// table's file rows still kept in the catalog begins at it; [`RowsRemoved::Unknown`]
+    /// otherwise, as a flush, whose delete files begin at the snapshots that first deleted
+    /// their rows, and a delete that rewrites a data file's delete file leave the same rows,
+    /// and one transaction may hold both. [`RowsRemoved::No`] is for a snapshot that names
+    /// no delete of the table. A snapshot that
+    /// inserted nothing and removed nothing is left out, and so is one expired since.
+    ///
+    /// It is one read of the catalog's change ledger within the window, and one of the
+    /// table's inlined deletions when an entry names deletes that left no file, both in one
+    /// transaction that sees one snapshot of the catalog.
+    fn list_table_row_changes(
+        &self,
+        _table_id: i64,
+        _after: Option<i64>,
+        _through: Option<i64>,
+        _limit: Option<usize>,
+    ) -> Result<Vec<TableRowChange>> {
+        Err(DuckLakeError::Unsupported(
+            "listing a table's row changes is not supported by this backend".to_string(),
         ))
     }
 
